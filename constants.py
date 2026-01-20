@@ -341,7 +341,8 @@ EMPHASIS_BRAKING_G_THRESHOLD = 0.3    # Minimum braking G for rear emphasis
 EMPHASIS_SMOOTHING_FACTOR = 0.3       # 30% interpolation per frame
 
 # Visual parameters
-EMPHASIS_MAX_SCALE_BOOST = 0.15       # Max 15% size increase
+EMPHASIS_MAX_SCALE_BOOST = 0.25       # Max 25% size increase for side cameras
+EMPHASIS_REAR_SCALE_BOOST = 0.50      # Max 50% size increase for rear camera (more important when reversing)
 EMPHASIS_BORDER_WIDTH = 4             # Border thickness in pixels
 EMPHASIS_VISIBILITY_THRESHOLD = 0.05  # Minimum weight to show border
 

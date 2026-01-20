@@ -44,6 +44,7 @@ from constants import (
     SPEED_ZONE_LOW, SPEED_ZONE_MID, SPEED_ZONE_HIGH,
     GBALL_ZONE_SAFE, GBALL_ZONE_SPORT,
     EMPHASIS_MAX_SCALE_BOOST,
+    EMPHASIS_REAR_SCALE_BOOST,
     EMPHASIS_VISIBILITY_THRESHOLD,
 )
 
@@ -1168,7 +1169,7 @@ def composite_frame(front: np.ndarray,
     # Top row (pillars): smaller 280x158 thumbnails
     # Bottom row (repeaters + rear): larger 350x197 thumbnails (1.25x) for emphasis
     # Dynamic scaling: thumbnails grow when emphasized (up to EMPHASIS_MAX_SCALE_BOOST)
-    # Growth direction: toward screen center (left grows right, right grows left, bottom grows up)
+    # Growth direction: toward screen center, with top row shifting up to avoid overlap
     if layout == "pip" and active_cams == {"back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"}:
         # Front camera fills entire background
         if front is not None:
@@ -1182,56 +1183,32 @@ def composite_frame(front: np.ndarray,
         right_rep_emph = emphasis.right_repeater if emphasis else None
         back_emph = emphasis.back if emphasis else None
 
-        def _calc_pip_scale(emph):
-            """Calculate scale factor from emphasis weight (1.0 to 1.0 + MAX_SCALE_BOOST)."""
+        def _calc_pip_scale(emph, max_boost=EMPHASIS_MAX_SCALE_BOOST):
+            """Calculate scale factor from emphasis weight (1.0 to 1.0 + max_boost)."""
             if not emph or emph.weight <= EMPHASIS_VISIBILITY_THRESHOLD:
                 return 1.0
-            return 1.0 + emph.weight * EMPHASIS_MAX_SCALE_BOOST
+            return 1.0 + emph.weight * max_boost
 
-        # Top row: L-PILLAR (left edge), R-PILLAR (right edge)
-        # Top-left pillar: anchored at top-left, grows DOWN and RIGHT
-        if left_pill is not None:
-            scale = _calc_pip_scale(left_pill_emph)
-            scaled_w = int(PIP_TOP_THUMB_WIDTH * scale)
-            scaled_h = int(PIP_TOP_THUMB_HEIGHT * scale)
-            # Anchor at top-left corner (grows right and down)
-            x = PIP_TOP_LEFT_X
-            y = PIP_TOP_ROW_Y
-            resized = _resize_frame(left_pill, (scaled_w, scaled_h))
-            # Clip to canvas bounds
-            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
-            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
-            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
-            _draw_text(canvas, "L-PILLAR", (x + 90, y + scaled_h - 30))
-            if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
-                                     left_pill_emph.border_color, left_pill_emph.border_width)
+        # Calculate scales for all cameras first to determine layout shifts
+        # Rear camera uses larger scale boost (50%) for better visibility when reversing
+        left_rep_scale = _calc_pip_scale(left_rep_emph)
+        right_rep_scale = _calc_pip_scale(right_rep_emph)
+        back_scale = _calc_pip_scale(back_emph, EMPHASIS_REAR_SCALE_BOOST)
+        left_pill_scale = _calc_pip_scale(left_pill_emph)
+        right_pill_scale = _calc_pip_scale(right_pill_emph)
 
-        # Top-right pillar: anchored at top-right, grows DOWN and LEFT
-        if right_pill is not None:
-            scale = _calc_pip_scale(right_pill_emph)
-            scaled_w = int(PIP_TOP_THUMB_WIDTH * scale)
-            scaled_h = int(PIP_TOP_THUMB_HEIGHT * scale)
-            # Anchor at top-right corner (grows left and down)
-            x = PIP_TOP_RIGHT_X + PIP_TOP_THUMB_WIDTH - scaled_w
-            y = PIP_TOP_ROW_Y
-            resized = _resize_frame(right_pill, (scaled_w, scaled_h))
-            # Clip to canvas bounds
-            x = max(0, x)
-            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
-            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
-            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
-            _draw_text(canvas, "R-PILLAR", (x + 90, y + scaled_h - 30))
-            if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
-                                     right_pill_emph.border_color, right_pill_emph.border_width)
+        # Calculate how much the bottom row grows upward (max of all bottom cameras)
+        max_bottom_scale = max(left_rep_scale, right_rep_scale, back_scale)
+        bottom_growth = int(PIP_BOTTOM_THUMB_HEIGHT * (max_bottom_scale - 1.0))
 
-        # Bottom row: L-REPEATER (left), REAR (center, with punch-in), R-REPEATER (right)
+        # Shift top row up to avoid overlap with bottom row
+        top_row_y_offset = bottom_growth
+
+        # --- BOTTOM ROW (draw first so top row overlaps if needed) ---
         # Bottom-left repeater: anchored at bottom-left, grows UP and RIGHT
         if left_rep is not None:
-            scale = _calc_pip_scale(left_rep_emph)
-            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
-            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * left_rep_scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * left_rep_scale)
             # Anchor at bottom-left (grows up and right)
             x = PIP_BOTTOM_LEFT_X
             y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
@@ -1248,9 +1225,8 @@ def composite_frame(front: np.ndarray,
 
         # Rear camera: anchored at bottom-center, grows UP (centered horizontally)
         if back is not None:
-            scale = _calc_pip_scale(back_emph)
-            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
-            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * back_scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * back_scale)
             # Anchor at bottom-center (grows up, centered)
             x = PIP_BOTTOM_CENTER_X + (PIP_BOTTOM_THUMB_WIDTH - scaled_w) // 2
             y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
@@ -1270,9 +1246,8 @@ def composite_frame(front: np.ndarray,
 
         # Bottom-right repeater: anchored at bottom-right, grows UP and LEFT
         if right_rep is not None:
-            scale = _calc_pip_scale(right_rep_emph)
-            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
-            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * right_rep_scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * right_rep_scale)
             # Anchor at bottom-right (grows up and left)
             x = PIP_BOTTOM_RIGHT_X + PIP_BOTTOM_THUMB_WIDTH - scaled_w
             y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
@@ -1287,6 +1262,48 @@ def composite_frame(front: np.ndarray,
             if right_rep_emph and right_rep_emph.border_color and right_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
                 _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      right_rep_emph.border_color, right_rep_emph.border_width)
+
+        # --- TOP ROW (draw after bottom row, with Y offset to avoid overlap) ---
+        # Top-left pillar: anchored at bottom-left of its position, grows UP and RIGHT
+        if left_pill is not None:
+            scaled_w = int(PIP_TOP_THUMB_WIDTH * left_pill_scale)
+            scaled_h = int(PIP_TOP_THUMB_HEIGHT * left_pill_scale)
+            # Anchor at bottom-left of top row position (grows up and right)
+            x = PIP_TOP_LEFT_X
+            # Base Y is at bottom of top row slot, shifted up by bottom row growth
+            base_bottom_y = PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - top_row_y_offset
+            y = base_bottom_y - scaled_h
+            resized = _resize_frame(left_pill, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            y = max(0, y)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "L-PILLAR", (x + 90, y + scaled_h - 30))
+            if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
+                                     left_pill_emph.border_color, left_pill_emph.border_width)
+
+        # Top-right pillar: anchored at bottom-right of its position, grows UP and LEFT
+        if right_pill is not None:
+            scaled_w = int(PIP_TOP_THUMB_WIDTH * right_pill_scale)
+            scaled_h = int(PIP_TOP_THUMB_HEIGHT * right_pill_scale)
+            # Anchor at bottom-right of top row position (grows up and left)
+            x = PIP_TOP_RIGHT_X + PIP_TOP_THUMB_WIDTH - scaled_w
+            # Base Y is at bottom of top row slot, shifted up by bottom row growth
+            base_bottom_y = PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - top_row_y_offset
+            y = base_bottom_y - scaled_h
+            resized = _resize_frame(right_pill, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            x = max(0, x)
+            y = max(0, y)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "R-PILLAR", (x + 90, y + scaled_h - 30))
+            if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
+                                     right_pill_emph.border_color, right_pill_emph.border_width)
 
         return canvas
 
