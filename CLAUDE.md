@@ -140,8 +140,10 @@ Context-aware camera highlighting that emphasizes relevant cameras based on driv
 
 **Visual effects**:
 - Colored inset borders (4px, drawn inside camera frame to prevent overlap)
-- Up to 15% size increase in some layouts (growth direction prevents collision)
+- Side cameras: up to 25% size increase when emphasized
+- Rear camera: up to 50% size increase when emphasized (for braking and reverse)
 - 30% smoothing per frame for gradual transitions
+- In PIP layout, top row shifts upward when bottom row scales to avoid overlap
 
 **Overlap prevention**:
 - When both left AND right cameras emphasized simultaneously, each capped to 50% max scale
