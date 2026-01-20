@@ -31,6 +31,13 @@ from constants import (
     REPEATER_LAYOUT_CENTER_WIDTH, REPEATER_LAYOUT_SIDE_WIDTH,
     GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT,
     SIDE_LAYOUT_FRONT_WIDTH, SIDE_LAYOUT_SIDE_WIDTH,
+    # PiP layout constants (bottom-anchored with separate row sizes)
+    PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT,
+    PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+    PIP_TOP_LEFT_X, PIP_TOP_RIGHT_X,
+    PIP_BOTTOM_LEFT_X, PIP_BOTTOM_CENTER_X, PIP_BOTTOM_RIGHT_X,
+    PIP_TOP_ROW_Y, PIP_BOTTOM_ROW_Y,
+    PIP_REAR_CROP_PERCENT,
     MPS_TO_MPH,
     SPEED_ZONE_ECO, SPEED_ZONE_CITY, SPEED_ZONE_SUBURBAN,
     SPEED_ZONE_HIGHWAY, SPEED_ZONE_FAST, SPEED_ZONE_VERY_FAST,
@@ -730,6 +737,25 @@ def _flip_horizontal(frame: np.ndarray) -> np.ndarray:
     return np.fliplr(frame)
 
 
+def _crop_center(frame: np.ndarray, crop_percent: float) -> np.ndarray:
+    """Crop to center portion of frame, removing edges.
+
+    Used for "punch-in" effect to remove wide-angle lens vignetting
+    (e.g., rear camera with fisheye distortion at edges).
+
+    Args:
+        frame: Input frame (H, W, C)
+        crop_percent: Percentage to remove from each edge (e.g., 0.05 = 5%)
+
+    Returns:
+        Cropped frame (smaller dimensions)
+    """
+    h, w = frame.shape[:2]
+    crop_h = int(h * crop_percent)
+    crop_w = int(w * crop_percent)
+    return frame[crop_h:h-crop_h, crop_w:w-crop_w]
+
+
 def _draw_text(canvas: np.ndarray, text: str, position: Tuple[int, int],
                color: Tuple[int, int, int] = COLORS.WHITE, size: int = 16) -> None:
     """Draw text on canvas using a small overlay buffer.
@@ -783,15 +809,20 @@ def composite_frame(front: np.ndarray,
                     back: Optional[np.ndarray] = None,
                     left_pill: Optional[np.ndarray] = None,
                     right_pill: Optional[np.ndarray] = None,
-                    cameras: Optional[Set[str]] = None) -> np.ndarray:
+                    cameras: Optional[Set[str]] = None,
+                    layout: str = "grid") -> np.ndarray:
     """
     Composite multiple camera frames into a single output frame.
 
-    Adaptive layout based on selected cameras:
+    Adaptive layout based on selected cameras and layout mode:
     - Front only: Full screen 1920x1080
     - Front + back: Top/bottom split
     - Front + repeaters: Center + side panels
-    - Multi-camera: Original 6-camera grid layout
+    - All cameras with layout="pip": Fullscreen front with PIP thumbnails
+    - Multi-camera: Original 6-camera grid layout (default)
+
+    Args:
+        layout: "grid" (default 6-camera grid) or "pip" (fullscreen with thumbnails)
     """
     canvas = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
 
@@ -899,6 +930,56 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(right_pill, (SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
             canvas[:, SIDE_LAYOUT_FRONT_WIDTH:] = resized
             _draw_text(canvas, "R. Pillar", (SIDE_LAYOUT_FRONT_WIDTH + 20, 10), COLORS.WHITE, 16)
+        return canvas
+
+    # --- LAYOUT 9: Fullscreen front with PIP thumbnails (bottom-anchored) ---
+    # Triggered when all 5 secondary cameras are present AND layout is "pip"
+    # Top row (pillars): smaller 280x158 thumbnails
+    # Bottom row (repeaters + rear): larger 350x197 thumbnails (1.25x) for emphasis
+    if layout == "pip" and active_cams == {"back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"}:
+        # Front camera fills entire background
+        if front is not None:
+            resized_front = _resize_frame(front, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+            canvas[:, :] = resized_front
+
+        # Separate sizes for each row
+        top_thumb_size = (PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT)
+        bottom_thumb_size = (PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT)
+
+        # Top row: L-PILLAR (left edge), R-PILLAR (right edge)
+        if left_pill is not None:
+            resized = _resize_frame(left_pill, top_thumb_size)
+            canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
+                   PIP_TOP_LEFT_X:PIP_TOP_LEFT_X+PIP_TOP_THUMB_WIDTH] = resized
+            _draw_text(canvas, "L-PILLAR", (PIP_TOP_LEFT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+
+        if right_pill is not None:
+            resized = _resize_frame(right_pill, top_thumb_size)
+            canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
+                   PIP_TOP_RIGHT_X:PIP_TOP_RIGHT_X+PIP_TOP_THUMB_WIDTH] = resized
+            _draw_text(canvas, "R-PILLAR", (PIP_TOP_RIGHT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+
+        # Bottom row: L-REPEATER (left), REAR (center, with punch-in), R-REPEATER (right)
+        if left_rep is not None:
+            resized = _resize_frame(left_rep, bottom_thumb_size)
+            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
+                   PIP_BOTTOM_LEFT_X:PIP_BOTTOM_LEFT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
+            _draw_text(canvas, "L-REPEATER", (PIP_BOTTOM_LEFT_X + 110, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+
+        if back is not None:
+            # Apply punch-in crop before resize to remove wide-angle vignetting
+            cropped = _crop_center(back, PIP_REAR_CROP_PERCENT)
+            resized = _flip_horizontal(_resize_frame(cropped, bottom_thumb_size))
+            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
+                   PIP_BOTTOM_CENTER_X:PIP_BOTTOM_CENTER_X+PIP_BOTTOM_THUMB_WIDTH] = resized
+            _draw_text(canvas, "REAR", (PIP_BOTTOM_CENTER_X + 145, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+
+        if right_rep is not None:
+            resized = _resize_frame(right_rep, bottom_thumb_size)
+            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
+                   PIP_BOTTOM_RIGHT_X:PIP_BOTTOM_RIGHT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
+            _draw_text(canvas, "R-REPEATER", (PIP_BOTTOM_RIGHT_X + 105, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+
         return canvas
 
     # --- DEFAULT LAYOUT: Original 6-camera grid ---

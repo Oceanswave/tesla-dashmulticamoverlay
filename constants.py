@@ -150,7 +150,16 @@ BLINKER_SIZE = 20          # Arrow size
 # =============================================================================
 
 MAP_SIZE = 300
-MAP_ZOOM_WINDOW = 0.002  # Degrees (~200m view)
+MAP_ZOOM_WINDOW = 0.002  # Degrees (~200m view) - default/fallback
+
+# Dynamic map zoom based on speed (degrees, smaller = tighter zoom)
+MAP_ZOOM_CREEPING = 0.0008    # < 15 mph: ~60m view (parking, traffic)
+MAP_ZOOM_CITY_SLOW = 0.0012   # 15-30 mph: ~100m view (city driving)
+MAP_ZOOM_CITY = 0.0018        # 30-45 mph: ~150m view (busy streets)
+MAP_ZOOM_SUBURBAN = 0.0025    # 45-60 mph: ~220m view (suburban roads)
+MAP_ZOOM_HIGHWAY = 0.0035     # 60-75 mph: ~300m view (highway)
+MAP_ZOOM_FAST = 0.0045        # 75+ mph: ~400m view (fast highway)
+
 MAP_PADDING = 0.1
 MAP_SUPERSAMPLE = 2  # Render at 2x resolution for sub-pixel smooth scrolling
 MAP_ARROW_LENGTH = 15
@@ -233,6 +242,48 @@ GRID_2X2_HALF_HEIGHT = 540
 # Side-by-side layout: Front takes 2/3, side camera takes 1/3
 SIDE_LAYOUT_FRONT_WIDTH = 1280  # 2/3 of 1920
 SIDE_LAYOUT_SIDE_WIDTH = 640    # 1/3 of 1920
+
+
+# =============================================================================
+# Layout: Fullscreen Front with PIP Thumbnails (Bottom-Anchored)
+# =============================================================================
+# Layout pushes thumbnails to bottom edge with larger bottom row for
+# more important cameras (repeaters + rear). Bottom row is 1.25x larger.
+
+# Top row (pillars) - standard size
+PIP_TOP_THUMB_WIDTH = 280
+PIP_TOP_THUMB_HEIGHT = 158  # Maintains ~16:9 aspect
+
+# Bottom row (repeaters + rear) - 1.25x larger for emphasis
+PIP_BOTTOM_THUMB_WIDTH = 350   # 280 * 1.25
+PIP_BOTTOM_THUMB_HEIGHT = 197  # 158 * 1.25
+
+PIP_EDGE_MARGIN = 40
+PIP_ROW_GAP = 15  # Gap between top and bottom rows
+
+# Row Y positions (calculated bottom-up for bottom-anchored layout)
+# Bottom margin: 40px, bottom row height: 197px, gap: 15px, top row height: 158px
+PIP_BOTTOM_ROW_Y = OUTPUT_HEIGHT - PIP_EDGE_MARGIN - PIP_BOTTOM_THUMB_HEIGHT  # 843
+PIP_TOP_ROW_Y = PIP_BOTTOM_ROW_Y - PIP_ROW_GAP - PIP_TOP_THUMB_HEIGHT  # 670
+
+# Top row X positions (280px thumbnails)
+PIP_TOP_LEFT_X = PIP_EDGE_MARGIN  # 40
+PIP_TOP_RIGHT_X = OUTPUT_WIDTH - PIP_EDGE_MARGIN - PIP_TOP_THUMB_WIDTH  # 1600
+
+# Bottom row X positions (350px thumbnails)
+PIP_BOTTOM_LEFT_X = PIP_EDGE_MARGIN  # 40
+PIP_BOTTOM_CENTER_X = (OUTPUT_WIDTH - PIP_BOTTOM_THUMB_WIDTH) // 2  # 785
+PIP_BOTTOM_RIGHT_X = OUTPUT_WIDTH - PIP_EDGE_MARGIN - PIP_BOTTOM_THUMB_WIDTH  # 1530
+
+# Rear camera punch-in (crop to remove wide-angle vignetting)
+PIP_REAR_CROP_PERCENT = 0.05  # 5% from each edge
+
+# Legacy aliases for backward compatibility (deprecated)
+PIP_THUMB_WIDTH = PIP_TOP_THUMB_WIDTH
+PIP_THUMB_HEIGHT = PIP_TOP_THUMB_HEIGHT
+PIP_LEFT_X = PIP_TOP_LEFT_X
+PIP_RIGHT_X = PIP_TOP_RIGHT_X
+PIP_CENTER_X = PIP_BOTTOM_CENTER_X
 
 
 # =============================================================================

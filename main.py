@@ -167,6 +167,8 @@ class VideoConfig(BaseModel):
     cameras: Set[str] = Field(default_factory=lambda: ALL_CAMERAS.copy())
     watermark_path: Optional[str] = Field(default=None)
     show_timestamp: bool = Field(default=False)
+    layout: str = Field(default="grid")
+    workers: Optional[int] = Field(default=None, ge=1)
 
     class Config:
         arbitrary_types_allowed = True
@@ -271,6 +273,10 @@ def parse_args() -> VideoConfig:
                        help="Path to watermark image to overlay in lower-right corner")
     parser.add_argument("--timestamp", action="store_true",
                        help="Burn in date/time from dashcam filename in lower-left corner")
+    parser.add_argument("--layout", choices=["grid", "pip"], default="grid",
+                       help="Multi-camera layout: grid (6-camera grid, default) or pip (fullscreen front with PIP thumbnails)")
+    parser.add_argument("--workers", "-j", type=int, default=None,
+                       help="Number of parallel workers (default: CPU count)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose (debug) logging")
 
@@ -319,7 +325,9 @@ def parse_args() -> VideoConfig:
             north_up=args.north_up,
             cameras=cameras,
             watermark_path=watermark_path,
-            show_timestamp=args.timestamp
+            show_timestamp=args.timestamp,
+            layout=args.layout,
+            workers=args.workers
         )
     except Exception as e:
         print_error(str(e))
@@ -338,7 +346,8 @@ def _init_worker(counter):
 # Worker function must be at module level for multiprocessing
 def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map_style: str, north_up: bool,
                       history: List[Tuple[float, float]], cameras: Set[str], sei_data: dict,
-                      watermark_path: Optional[str] = None, show_timestamp: bool = False):
+                      watermark_path: Optional[str] = None, show_timestamp: bool = False,
+                      layout: str = "grid"):
     """
     Worker to process a single clip.
 
@@ -354,6 +363,7 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
         sei_data: Pre-extracted SEI metadata dict (frame_idx -> metadata)
         watermark_path: Optional path to watermark image for lower-right corner
         show_timestamp: If True, burn in timestamp from clip filename
+        layout: Multi-camera layout: "grid" (default) or "pip" (fullscreen with thumbnails)
     """
     global _shared_frame_counter
 
@@ -417,7 +427,8 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                     back=frames.get('back'),
                     left_pill=frames.get('left_pill'),
                     right_pill=frames.get('right_pill'),
-                    cameras=cameras
+                    cameras=cameras,
+                    layout=layout
                 )
 
                 # Get interpolated GPS for smooth map (works even without meta)
@@ -435,7 +446,9 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                 # Map overlay renders EVERY FRAME using interpolated GPS for smooth scrolling
                 # This is outside the `if meta:` block so it updates every frame
                 if interp_lat != 0.0 or interp_lon != 0.0:  # Skip if no GPS data at all
-                    map_img = map_renderer.render(interp_heading, interp_lat, interp_lon)
+                    # Get current speed for dynamic zoom (use 0 if no metadata)
+                    current_speed = meta.vehicle_speed_mps if meta else 0.0
+                    map_img = map_renderer.render(interp_heading, interp_lat, interp_lon, current_speed)
                     map_x = OUTPUT_WIDTH - map_renderer.size - MAP_X_MARGIN
                     apply_overlay(canvas, map_img, map_x, MAP_Y)
 
@@ -701,6 +714,7 @@ def main():
         overlay_scale=config.overlay_scale,
         map_style=config.map_style,
         north_up=config.north_up,
+        layout=config.layout,
     )
 
     # 1. Extract telemetry from all clips (SEI data + GPS points + frame counts)
@@ -726,7 +740,7 @@ def main():
     logger.debug(f"Clips with telemetry: {sum(1 for s in clip_sei_data if s)}/{len(clip_sei_data)}")
 
     # 2. Parallel Processing (rendering only - SEI already extracted)
-    num_processes = min(multiprocessing.cpu_count(), len(config.playlist))
+    num_processes = config.workers if config.workers else multiprocessing.cpu_count()
     print_phase(2, 3, f"Rendering frames ([highlight]{num_processes}[/] workers)")
 
     # Use a temporary directory for intermediate files
@@ -742,7 +756,7 @@ def main():
             args_list.append((
                 clip, temp_file, config.overlay_scale, config.map_style, config.north_up,
                 clip_histories[i], config.cameras, clip_sei_data[i],
-                config.watermark_path, config.show_timestamp
+                config.watermark_path, config.show_timestamp, config.layout
             ))
 
         # Create shared counter for real-time frame progress

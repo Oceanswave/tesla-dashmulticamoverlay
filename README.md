@@ -65,6 +65,8 @@ python3 main.py /path/to/dashcam/folder/ output.mp4
 | `--overlay-scale` | Scale factor for dashboard/map overlays (0.5-2.0) | 1.0 |
 | `--map-style` | Map rendering style: `simple`, `street`, or `satellite` | simple |
 | `--cameras` | Comma-separated list of cameras to include | all |
+| `--layout` | Multi-camera layout: `grid` (6-camera grid) or `pip` (fullscreen with thumbnails) | grid |
+| `--workers`, `-j` | Number of parallel rendering workers | CPU count |
 | `--watermark` | Path to watermark image to overlay in lower-right corner | none |
 | `--timestamp` | Burn in date/time from dashcam filename in lower-left corner | off |
 | `-v, --verbose` | Enable debug logging | off |
@@ -247,7 +249,7 @@ The composite video (1920x1080) adapts based on selected cameras:
 +--------------------------------+----------------+
 ```
 
-### Layout 9: Full 6-Camera (default)
+### Layout 9: Full 6-Camera (default, `--layout grid`)
 
 ```
 +------------+-------------------------+------------+
@@ -258,6 +260,30 @@ The composite video (1920x1080) adapts based on selected cameras:
 |   640px    |       640px             |   640px    |
 +------------+-------------------------+------------+
 ```
+
+### Layout 10: Fullscreen with PIP Thumbnails (`--layout pip`)
+
+```
++-------------------------------------------------------+
+|                                                       |
+|              FRONT (fullscreen 1920x1080)             |
+|                                                       |
+|   +----------+                        +----------+    |
+|   | L-PILLAR |                        | R-PILLAR |    |
+|   +----------+                        +----------+    |
+|                                                       |
+|  +----------+    +----------+    +----------+         |
+|  |L-REPEATER|    |   REAR   |    |R-REPEATER|         |
+|  +----------+    +----------+    +----------+         |
++-------------------------------------------------------+
+```
+
+Use this layout when you want the front camera to fill the entire screen with other cameras as small picture-in-picture thumbnails:
+```bash
+python3 main.py input/ output.mp4 --layout pip
+```
+
+Thumbnail dimensions are 280x158 pixels each. The rear camera is horizontally flipped for a normalized driver's-perspective view.
 
 ### Overlay Positions
 

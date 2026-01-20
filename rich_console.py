@@ -175,6 +175,7 @@ def print_config_summary(
     overlay_scale: float = 1.0,
     map_style: str = "simple",
     north_up: bool = False,
+    layout: str = "grid",
 ) -> None:
     """
     Print a styled configuration summary panel.
@@ -186,6 +187,7 @@ def print_config_summary(
         overlay_scale: Scale factor for dashboard/map overlays
         map_style: Map background style
         north_up: Whether using north-up map orientation
+        layout: Multi-camera layout mode ("grid" or "pip")
     """
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Key", style="dim")
@@ -193,6 +195,7 @@ def print_config_summary(
 
     table.add_row("Clips", f"[highlight]{clip_count}[/]")
     table.add_row("Cameras", f"[camera]{', '.join(sorted(cameras))}[/]")
+    table.add_row("Layout", f"{layout}" if layout == "grid" else f"[highlight]{layout}[/] (fullscreen + thumbnails)")
     table.add_row("Output", f"[green]{output_file}[/]")
     table.add_row("Overlay Scale", f"{overlay_scale:.1f}x")
     table.add_row("Map Style", f"{map_style}")

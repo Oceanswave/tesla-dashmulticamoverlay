@@ -103,6 +103,9 @@ class MapRenderer:
         self._smoothed_heading: Optional[float] = None
         self._heading_smooth_factor = 0.15  # Smooth rotations
 
+        # Dynamic zoom smoothing (for speed-based zoom transitions)
+        self._current_zoom: Optional[float] = None
+
         # Tile grid cache for street/satellite modes
         # Tiles are cached by their grid coordinates (z, x, y), not arbitrary positions
         self._tile_grid_cache: dict = {}  # (z, x, y) -> PIL Image (256x256)
@@ -116,6 +119,7 @@ class MapRenderer:
         # - Rotation headroom (45° rotation needs √2 more coverage)
         # - Prefetch margin so tiles are ready before we scroll to edge
         self._composite_radius = 5  # 11x11 grid = 2816px composite
+        self._base_composite_radius = 5  # Store original for dynamic adjustment
         self._composite: Optional[Image.Image] = None  # Stitched composite image
         self._composite_origin_x: int = 0  # Tile X coordinate of top-left of composite
         self._composite_origin_y: int = 0  # Tile Y coordinate of top-left of composite
@@ -162,6 +166,80 @@ class MapRenderer:
             self._smoothed_heading -= 360
 
         return self._smoothed_heading
+
+    def _get_dynamic_zoom(self, speed_mps: float) -> Tuple[float, float]:
+        """Calculate zoom window and crop scale based on current speed.
+
+        Slower speeds get tighter zoom for detail (parking, city).
+        Faster speeds get broader zoom for route overview (highway).
+        Applies smoothing to prevent jarring zoom changes.
+        Also adjusts tile composite radius to ensure coverage at broader zooms.
+
+        Args:
+            speed_mps: Vehicle speed in meters per second
+
+        Returns:
+            Tuple of (smoothed zoom window in degrees, crop_scale for tile modes)
+            crop_scale: 1.0 = normal, >1 = zoomed in (less area visible),
+                       <1 = zoomed out (more area visible)
+        """
+        from constants import (
+            MAP_ZOOM_CREEPING, MAP_ZOOM_CITY_SLOW, MAP_ZOOM_CITY,
+            MAP_ZOOM_SUBURBAN, MAP_ZOOM_HIGHWAY, MAP_ZOOM_FAST
+        )
+
+        speed_mph = speed_mps * 2.237
+
+        # Determine target zoom, tile radius, and crop scale based on speed
+        # Crop scale range: 2.0 at slow speeds (very zoomed in) to 0.4 at high speeds (zoomed out)
+        # This creates a 5× visible difference between parking and highway speeds
+        if speed_mph < 15:
+            target_zoom = MAP_ZOOM_CREEPING
+            tile_radius = self._base_composite_radius
+            target_crop_scale = 2.0  # Very tight zoom for parking/detail
+        elif speed_mph < 30:
+            target_zoom = MAP_ZOOM_CITY_SLOW
+            tile_radius = self._base_composite_radius
+            target_crop_scale = 1.5  # City driving - still fairly tight
+        elif speed_mph < 45:
+            target_zoom = MAP_ZOOM_CITY
+            tile_radius = self._base_composite_radius
+            target_crop_scale = 1.1  # Normal city (baseline)
+        elif speed_mph < 60:
+            target_zoom = MAP_ZOOM_SUBURBAN
+            tile_radius = self._base_composite_radius + 1
+            target_crop_scale = 0.8  # Suburban - wider view
+        elif speed_mph < 75:
+            target_zoom = MAP_ZOOM_HIGHWAY
+            tile_radius = self._base_composite_radius + 2
+            target_crop_scale = 0.55  # Highway - much wider
+        else:
+            target_zoom = MAP_ZOOM_FAST
+            tile_radius = self._base_composite_radius + 3
+            target_crop_scale = 0.4  # Fast highway - very wide view
+
+        # Update composite radius for broader zoom levels (more tiles needed)
+        if self._composite_radius != tile_radius:
+            self._composite_radius = tile_radius
+            # Force composite rebuild on next tile fetch
+            self._composite = None
+
+        # Smooth zoom transitions (prevent jarring changes)
+        # Use 30% per frame for MUCH faster, more noticeable transitions
+        smooth_factor = 0.3
+
+        if self._current_zoom is None:
+            self._current_zoom = target_zoom
+            self._current_crop_scale = target_crop_scale
+        else:
+            self._current_zoom += (target_zoom - self._current_zoom) * smooth_factor
+            # Initialize crop scale if not set
+            if not hasattr(self, '_current_crop_scale') or self._current_crop_scale is None:
+                self._current_crop_scale = target_crop_scale
+            else:
+                self._current_crop_scale += (target_crop_scale - self._current_crop_scale) * smooth_factor
+
+        return self._current_zoom, self._current_crop_scale
 
     def _latlon_to_tile(self, lat: float, lon: float, zoom: int) -> Tuple[int, int]:
         """Convert lat/lon to tile coordinates at given zoom level.
@@ -320,7 +398,8 @@ class MapRenderer:
         )
         return composite, origin_lat, origin_lon
 
-    def render(self, heading_deg: float, current_lat: float, current_lon: float) -> np.ndarray:
+    def render(self, heading_deg: float, current_lat: float, current_lon: float,
+               speed_mps: float = 0.0) -> np.ndarray:
         """Render map overlay with path and heading arrow.
 
         Uses sub-pixel precision for smooth scrolling: computes floating-point
@@ -331,6 +410,7 @@ class MapRenderer:
             heading_deg: Current heading in degrees (0=North, 90=East, clockwise)
             current_lat: Current latitude (pre-interpolated for smooth scrolling)
             current_lon: Current longitude (pre-interpolated for smooth scrolling)
+            speed_mps: Current vehicle speed in m/s (for dynamic zoom adjustment)
 
         Returns:
             RGB numpy array of the rendered map overlay
@@ -338,9 +418,12 @@ class MapRenderer:
         # Apply heading smoothing for rotation
         smooth_heading = self._smooth_heading(heading_deg)
 
+        # Calculate dynamic zoom window and crop scale based on speed
+        zoom_window, crop_scale = self._get_dynamic_zoom(speed_mps)
+
         # Calculate sub-pixel offset for smooth scrolling
         # We'll draw at integer positions, then shift by the fractional part
-        geo_scale = (self._internal_size * (1 - 2 * self.padding)) / (self.zoom_window * 2)
+        geo_scale = (self._internal_size * (1 - 2 * self.padding)) / (zoom_window * 2)
 
         # Use a reference point (first path point) for stable rendering
         if self.path:
@@ -366,10 +449,21 @@ class MapRenderer:
         # Track sub-pixel offset for smooth scrolling (will be applied via affine transform)
         tile_frac_x, tile_frac_y = 0.0, 0.0
 
-        if self.map_style != "simple":
+        # Track tile mode state for path drawing
+        is_tile_mode = self.map_style != "simple"
+        tile_composite_origin_x = 0
+        tile_composite_origin_y = 0
+        tile_zoom = 17  # Default, will be overwritten
+
+        if is_tile_mode:
             composite, origin_lat, origin_lon = self._fetch_tile(current_lat, current_lon)
             if composite is not None:
                 from constants import MAP_TILE_ZOOM
+                tile_zoom = MAP_TILE_ZOOM
+
+                # Store composite origin for path drawing
+                tile_composite_origin_x = self._composite_origin_x
+                tile_composite_origin_y = self._composite_origin_y
 
                 # Calculate pixel positions in absolute tile coordinate space
                 # This gives us sub-pixel precision for smooth scrolling
@@ -387,6 +481,11 @@ class MapRenderer:
                 frac_offset_x = offset_x - int_offset_x
                 frac_offset_y = offset_y - int_offset_y
 
+                # Calculate crop size based on speed-based crop_scale
+                # crop_scale > 1 = zoomed in (smaller crop = shows less area)
+                # crop_scale < 1 = zoomed out (larger crop = shows more area)
+                crop_half = int(internal_size / (2 * crop_scale))
+
                 # Composite is north-up, we need to rotate for heading-up
                 if self.heading_up:
                     rotated = composite.rotate(smooth_heading, resample=Image.Resampling.BILINEAR,
@@ -402,28 +501,35 @@ class MapRenderer:
                     rotated_cx = cx_offset * cos_r - cy_offset * sin_r
                     rotated_cy = cx_offset * sin_r + cy_offset * cos_r
 
-                    # Crop centered on rotated position
+                    # Crop centered on rotated position with speed-based crop size
                     crop_cx = rotated.width // 2 + int(rotated_cx)
                     crop_cy = rotated.height // 2 + int(rotated_cy)
-                    half = internal_size // 2
-                    img = rotated.crop((crop_cx - half, crop_cy - half, crop_cx + half, crop_cy + half))
+                    cropped = rotated.crop((crop_cx - crop_half, crop_cy - crop_half,
+                                            crop_cx + crop_half, crop_cy + crop_half))
+
+                    # Scale back to internal_size (this creates the zoom effect)
+                    img = cropped.resize((internal_size, internal_size), Image.Resampling.BILINEAR)
 
                     # Rotate fractional offset for sub-pixel shift (applied later)
-                    tile_frac_x = frac_offset_x * cos_r - frac_offset_y * sin_r
-                    tile_frac_y = frac_offset_x * sin_r + frac_offset_y * cos_r
+                    # Scale by crop_scale since we resized
+                    tile_frac_x = (frac_offset_x * cos_r - frac_offset_y * sin_r) * crop_scale
+                    tile_frac_y = (frac_offset_x * sin_r + frac_offset_y * cos_r) * crop_scale
                 else:
                     # Crop directly at our position for north-up mode
-                    half = internal_size // 2
-                    img = composite.crop((int_offset_x - half, int_offset_y - half,
-                                          int_offset_x + half, int_offset_y + half))
+                    cropped = composite.crop((int_offset_x - crop_half, int_offset_y - crop_half,
+                                              int_offset_x + crop_half, int_offset_y + crop_half))
 
-                    # Store fractional offset for sub-pixel shift
-                    tile_frac_x = frac_offset_x
-                    tile_frac_y = frac_offset_y
+                    # Scale back to internal_size
+                    img = cropped.resize((internal_size, internal_size), Image.Resampling.BILINEAR)
+
+                    # Store fractional offset for sub-pixel shift, scaled
+                    tile_frac_x = frac_offset_x * crop_scale
+                    tile_frac_y = frac_offset_y * crop_scale
 
                 img = img.convert('RGB')
             else:
                 img = Image.new('RGB', (internal_size, internal_size), COLORS.VOID_BLACK)
+                is_tile_mode = False  # Fall back to simple mode drawing
         else:
             # Simple mode: draw a grid that scrolls with position
             img = Image.new('RGB', (internal_size, internal_size), COLORS.VOID_BLACK)
@@ -431,9 +537,16 @@ class MapRenderer:
 
         draw = ImageDraw.Draw(img)
 
-        # Draw path if we have points (using integer offset from reference)
+        # Draw path if we have points
         if len(self.path) > 1:
-            self._draw_path_subpixel(draw, ref_lat, ref_lon, int_dx, int_dy, smooth_heading, geo_scale)
+            if is_tile_mode:
+                # Use tile-coordinate path drawing for proper alignment with map tiles
+                self._draw_path_tile_coords(draw, tile_composite_origin_x, tile_composite_origin_y,
+                                            tile_zoom, current_lat, current_lon, smooth_heading,
+                                            crop_scale)
+            else:
+                # Simple mode uses geo_scale-based path drawing
+                self._draw_path_subpixel(draw, ref_lat, ref_lon, int_dx, int_dy, smooth_heading, geo_scale)
 
         # Draw current position arrow (always at center, points UP in heading-up mode)
         self._draw_position_arrow(draw, smooth_heading)
@@ -446,7 +559,7 @@ class MapRenderer:
         # with bilinear interpolation for smooth anti-aliased movement
         # For tile modes: use tile_frac_x/y (already rotated if heading-up)
         # For simple mode: use frac_dx/dy from path reference calculation
-        if self.map_style != "simple":
+        if is_tile_mode:
             sub_px_x, sub_px_y = tile_frac_x, tile_frac_y
         else:
             # For simple mode, rotate the path-based fractional offset
@@ -556,6 +669,121 @@ class MapRenderer:
 
             draw.line([(x1, y1), (x2, y2)], fill=grid_color, width=1)
 
+    def _draw_path_tile_coords(self, draw: ImageDraw.Draw, composite_origin_x: int,
+                                composite_origin_y: int, zoom: int,
+                                current_lat: float, current_lon: float,
+                                heading_deg: float, crop_scale: float = 1.0) -> None:
+        """Draw GPS path using tile pixel coordinates (Web Mercator projection).
+
+        This method draws the path using the SAME coordinate system as the tiles,
+        ensuring the path aligns exactly with map features. Uses _latlon_to_pixel()
+        instead of linear geo_scale for proper Web Mercator projection.
+
+        Args:
+            draw: ImageDraw context
+            composite_origin_x: Tile X coordinate of composite's top-left corner
+            composite_origin_y: Tile Y coordinate of composite's top-left corner
+            zoom: Tile zoom level (typically MAP_TILE_ZOOM = 17)
+            current_lat, current_lon: Current position for centering
+            heading_deg: Current heading for rotation
+            crop_scale: Zoom scaling factor (1.0 = normal, >1 = zoomed in)
+        """
+        if len(self.path) < 2:
+            return
+
+        # Get current position in absolute pixel coordinates
+        current_px, current_py = self._latlon_to_pixel(current_lat, current_lon, zoom)
+
+        # Composite origin in absolute pixel coordinates
+        origin_px = composite_origin_x * self._tile_size
+        origin_py = composite_origin_y * self._tile_size
+
+        # Position within composite
+        offset_x = current_px - origin_px
+        offset_y = current_py - origin_py
+
+        # Rotation for heading-up mode
+        rotation_rad = math.radians(-heading_deg) if self.heading_up else 0
+        cos_r = math.cos(rotation_rad)
+        sin_r = math.sin(rotation_rad)
+
+        internal_size = self._internal_size
+        center = internal_size // 2
+        visible_radius = internal_size * 0.75
+
+        # Composite center (for rotation origin)
+        comp_size = (2 * self._composite_radius + 1) * self._tile_size
+        comp_center = comp_size // 2
+
+        def to_screen(lat: float, lon: float) -> Tuple[float, float]:
+            """Convert lat/lon to screen coordinates using tile pixel projection."""
+            # Get absolute pixel position in Web Mercator
+            px, py = self._latlon_to_pixel(lat, lon, zoom)
+
+            # Position relative to composite origin
+            rel_x = px - origin_px
+            rel_y = py - origin_py
+
+            if self.heading_up:
+                # Offset from composite center (rotation happens around composite center)
+                cx_off = rel_x - comp_center
+                cy_off = rel_y - comp_center
+
+                # Rotate around composite center
+                rot_cx = cx_off * cos_r - cy_off * sin_r
+                rot_cy = cx_off * sin_r + cy_off * cos_r
+
+                # Current position in rotated composite
+                cur_cx_off = offset_x - comp_center
+                cur_cy_off = offset_y - comp_center
+                cur_rot_cx = cur_cx_off * cos_r - cur_cy_off * sin_r
+                cur_rot_cy = cur_cx_off * sin_r + cur_cy_off * cos_r
+
+                # Screen position (relative to crop center which is at current position)
+                screen_x = center + (rot_cx - cur_rot_cx) * crop_scale
+                screen_y = center + (rot_cy - cur_rot_cy) * crop_scale
+            else:
+                # North-up mode: direct offset from current position
+                screen_x = center + (rel_x - offset_x) * crop_scale
+                screen_y = center + (rel_y - offset_y) * crop_scale
+
+            return (screen_x, screen_y)
+
+        def is_segment_visible(pt1: Tuple[float, float], pt2: Tuple[float, float]) -> bool:
+            """Check if a line segment is potentially visible on screen."""
+            for px, py in [pt1, pt2]:
+                dist = math.sqrt((px - center) ** 2 + (py - center) ** 2)
+                if dist < visible_radius:
+                    return True
+            mid_x = (pt1[0] + pt2[0]) / 2
+            mid_y = (pt1[1] + pt2[1]) / 2
+            mid_dist = math.sqrt((mid_x - center) ** 2 + (mid_y - center) ** 2)
+            return mid_dist < visible_radius
+
+        # Draw path segments
+        n_segments = len(self.path) - 1
+        line_width = max(2, int(3 * self.scale * self._supersample * crop_scale))
+
+        for i in range(n_segments):
+            p1 = self.path[i]
+            p2 = self.path[i + 1]
+
+            pt1 = to_screen(p1[0], p1[1])
+            pt2 = to_screen(p2[0], p2[1])
+
+            if not is_segment_visible(pt1, pt2):
+                continue
+
+            # Fade factor: 0 at oldest, 1 at newest
+            fade = 1.0 - (i / n_segments)
+
+            speed = p2[2] if len(p2) > 2 else 0.0
+            speed_color = self._get_speed_color(speed)
+            faded_color = self._blend_color(speed_color, fade)
+
+            draw.line([(int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))],
+                      fill=faded_color, width=line_width)
+
     def _get_speed_color(self, speed_mps: float) -> Tuple[int, int, int]:
         """Get color based on speed (m/s converted to mph internally).
 
@@ -605,12 +833,19 @@ class MapRenderer:
             heading_deg: Current heading for rotation
             geo_scale: Pixels per degree for coordinate conversion
         """
+        if len(self.path) < 2:
+            return
+
         # Rotation for heading-up mode
         rotation_rad = math.radians(-heading_deg) if self.heading_up else 0
+        cos_r = math.cos(rotation_rad)
+        sin_r = math.sin(rotation_rad)
 
         center = self._internal_size // 2
+        # Visible radius with margin for rotation (diagonal of square = sqrt(2) * side)
+        visible_radius = self._internal_size * 0.75
 
-        def to_screen(lat: float, lon: float) -> Tuple[int, int]:
+        def to_screen(lat: float, lon: float) -> Tuple[float, float]:
             """Convert lat/lon to screen coordinates relative to reference + offset."""
             # Position relative to reference point
             dx = (lon - ref_lon) * geo_scale
@@ -621,50 +856,55 @@ class MapRenderer:
             dy -= int_offset_y
 
             if self.heading_up:
-                cos_r = math.cos(rotation_rad)
-                sin_r = math.sin(rotation_rad)
                 dx_rot = dx * cos_r - dy * sin_r
                 dy_rot = dx * sin_r + dy * cos_r
                 dx, dy = dx_rot, dy_rot
 
-            return (int(center + dx), int(center + dy))
+            return (center + dx, center + dy)
 
-        # Filter to nearby points - use a generous window since we're at internal resolution
-        # Estimate current position from reference + offset
-        current_lat_approx = ref_lat - int_offset_y / geo_scale
-        current_lon_approx = ref_lon + int_offset_x / geo_scale
+        def is_segment_visible(pt1: Tuple[float, float], pt2: Tuple[float, float]) -> bool:
+            """Check if a line segment is potentially visible on screen."""
+            # Check if either endpoint is within visible radius of center
+            for px, py in [pt1, pt2]:
+                dist = math.sqrt((px - center) ** 2 + (py - center) ** 2)
+                if dist < visible_radius:
+                    return True
+            # Also check if segment crosses through visible area
+            # (simplified: check midpoint)
+            mid_x = (pt1[0] + pt2[0]) / 2
+            mid_y = (pt1[1] + pt2[1]) / 2
+            mid_dist = math.sqrt((mid_x - center) ** 2 + (mid_y - center) ** 2)
+            return mid_dist < visible_radius
 
-        relevant_path = []
-        for p in self.path:
-            lat, lon = p[0], p[1]
-            speed = p[2] if len(p) > 2 else 0.0
-            if abs(lat - current_lat_approx) < 0.01 and abs(lon - current_lon_approx) < 0.01:
-                relevant_path.append((lat, lon, speed))
-
-        if len(relevant_path) < 2:
-            return
-
-        # Draw each segment with gradient fade and speed coloring
-        n_segments = len(relevant_path) - 1
+        # Draw ALL path segments, skipping only those completely off-screen
+        # This preserves path shape integrity (no straightening from filtered points)
+        n_segments = len(self.path) - 1
         line_width = max(2, int(3 * self.scale * self._supersample))
 
         for i in range(n_segments):
-            p1 = relevant_path[i]
-            p2 = relevant_path[i + 1]
+            p1 = self.path[i]
+            p2 = self.path[i + 1]
 
+            # Convert to screen coordinates
             pt1 = to_screen(p1[0], p1[1])
             pt2 = to_screen(p2[0], p2[1])
 
-            # Fade factor: 0 at newest (end), 1 at oldest (start)
+            # Skip segments that are completely outside visible area
+            if not is_segment_visible(pt1, pt2):
+                continue
+
+            # Fade factor: 0 at oldest (start), 1 at newest (end)
             fade = 1.0 - (i / n_segments)
 
             # Use speed from the segment endpoint for color
-            speed_color = self._get_speed_color(p2[2])
+            speed = p2[2] if len(p2) > 2 else 0.0
+            speed_color = self._get_speed_color(speed)
 
             # Apply fade to make older segments dimmer
             faded_color = self._blend_color(speed_color, fade)
 
-            draw.line([pt1, pt2], fill=faded_color, width=line_width)
+            draw.line([(int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1]))],
+                      fill=faded_color, width=line_width)
 
     def _draw_position_arrow(self, draw: ImageDraw.Draw, heading_deg: float) -> None:
         """Draw the current position indicator with dark border and glow effect."""
