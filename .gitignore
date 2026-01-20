@@ -219,5 +219,16 @@ __marimo__/
 # Ignore all mp4 files in the project directory and subdirectories
 *.mp4
 
-# Ignore everything in the data directory
-data/*
+# Ignore everything in the data/temp_clips directory
+data/
+.temp_clips/
+
+# Claude Code configuration (personal settings)
+.claude/
+
+# Test assets and extracted GPS data (may contain personal location info)
+sample_gps_data.json
+images/
+
+# macOS metadata
+.DS_Store
