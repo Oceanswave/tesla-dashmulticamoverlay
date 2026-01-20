@@ -1167,76 +1167,125 @@ def composite_frame(front: np.ndarray,
     # Triggered when all 5 secondary cameras are present AND layout is "pip"
     # Top row (pillars): smaller 280x158 thumbnails
     # Bottom row (repeaters + rear): larger 350x197 thumbnails (1.25x) for emphasis
-    # Note: PIP uses border-only emphasis (no scaling) due to fixed positions
+    # Dynamic scaling: thumbnails grow when emphasized (up to EMPHASIS_MAX_SCALE_BOOST)
+    # Growth direction: toward screen center (left grows right, right grows left, bottom grows up)
     if layout == "pip" and active_cams == {"back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"}:
         # Front camera fills entire background
         if front is not None:
             resized_front = _resize_frame(front, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
             canvas[:, :] = resized_front
 
-        # Separate sizes for each row
-        top_thumb_size = (PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT)
-        bottom_thumb_size = (PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT)
-
-        # Get emphasis states for border drawing
+        # Get emphasis states for scaling and border drawing
         left_pill_emph = emphasis.left_pillar if emphasis else None
         right_pill_emph = emphasis.right_pillar if emphasis else None
         left_rep_emph = emphasis.left_repeater if emphasis else None
         right_rep_emph = emphasis.right_repeater if emphasis else None
         back_emph = emphasis.back if emphasis else None
 
+        def _calc_pip_scale(emph):
+            """Calculate scale factor from emphasis weight (1.0 to 1.0 + MAX_SCALE_BOOST)."""
+            if not emph or emph.weight <= EMPHASIS_VISIBILITY_THRESHOLD:
+                return 1.0
+            return 1.0 + emph.weight * EMPHASIS_MAX_SCALE_BOOST
+
         # Top row: L-PILLAR (left edge), R-PILLAR (right edge)
+        # Top-left pillar: anchored at top-left, grows DOWN and RIGHT
         if left_pill is not None:
-            resized = _resize_frame(left_pill, top_thumb_size)
-            canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
-                   PIP_TOP_LEFT_X:PIP_TOP_LEFT_X+PIP_TOP_THUMB_WIDTH] = resized
-            _draw_text(canvas, "L-PILLAR", (PIP_TOP_LEFT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+            scale = _calc_pip_scale(left_pill_emph)
+            scaled_w = int(PIP_TOP_THUMB_WIDTH * scale)
+            scaled_h = int(PIP_TOP_THUMB_HEIGHT * scale)
+            # Anchor at top-left corner (grows right and down)
+            x = PIP_TOP_LEFT_X
+            y = PIP_TOP_ROW_Y
+            resized = _resize_frame(left_pill, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "L-PILLAR", (x + 90, y + scaled_h - 30))
             if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, PIP_TOP_LEFT_X, PIP_TOP_ROW_Y,
-                                     PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT,
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      left_pill_emph.border_color, left_pill_emph.border_width)
 
+        # Top-right pillar: anchored at top-right, grows DOWN and LEFT
         if right_pill is not None:
-            resized = _resize_frame(right_pill, top_thumb_size)
-            canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
-                   PIP_TOP_RIGHT_X:PIP_TOP_RIGHT_X+PIP_TOP_THUMB_WIDTH] = resized
-            _draw_text(canvas, "R-PILLAR", (PIP_TOP_RIGHT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+            scale = _calc_pip_scale(right_pill_emph)
+            scaled_w = int(PIP_TOP_THUMB_WIDTH * scale)
+            scaled_h = int(PIP_TOP_THUMB_HEIGHT * scale)
+            # Anchor at top-right corner (grows left and down)
+            x = PIP_TOP_RIGHT_X + PIP_TOP_THUMB_WIDTH - scaled_w
+            y = PIP_TOP_ROW_Y
+            resized = _resize_frame(right_pill, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            x = max(0, x)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "R-PILLAR", (x + 90, y + scaled_h - 30))
             if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, PIP_TOP_RIGHT_X, PIP_TOP_ROW_Y,
-                                     PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT,
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      right_pill_emph.border_color, right_pill_emph.border_width)
 
         # Bottom row: L-REPEATER (left), REAR (center, with punch-in), R-REPEATER (right)
+        # Bottom-left repeater: anchored at bottom-left, grows UP and RIGHT
         if left_rep is not None:
-            resized = _resize_frame(left_rep, bottom_thumb_size)
-            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
-                   PIP_BOTTOM_LEFT_X:PIP_BOTTOM_LEFT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
-            _draw_text(canvas, "L-REPEATER", (PIP_BOTTOM_LEFT_X + 110, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            scale = _calc_pip_scale(left_rep_emph)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            # Anchor at bottom-left (grows up and right)
+            x = PIP_BOTTOM_LEFT_X
+            y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
+            resized = _resize_frame(left_rep, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            y = max(0, y)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "L-REPEATER", (x + 110, y + scaled_h - 30))
             if left_rep_emph and left_rep_emph.border_color and left_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, PIP_BOTTOM_LEFT_X, PIP_BOTTOM_ROW_Y,
-                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      left_rep_emph.border_color, left_rep_emph.border_width)
 
+        # Rear camera: anchored at bottom-center, grows UP (centered horizontally)
         if back is not None:
+            scale = _calc_pip_scale(back_emph)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            # Anchor at bottom-center (grows up, centered)
+            x = PIP_BOTTOM_CENTER_X + (PIP_BOTTOM_THUMB_WIDTH - scaled_w) // 2
+            y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
             # Apply punch-in crop before resize to remove wide-angle vignetting
             cropped = _crop_center(back, PIP_REAR_CROP_PERCENT)
-            resized = _flip_horizontal(_resize_frame(cropped, bottom_thumb_size))
-            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
-                   PIP_BOTTOM_CENTER_X:PIP_BOTTOM_CENTER_X+PIP_BOTTOM_THUMB_WIDTH] = resized
-            _draw_text(canvas, "REAR", (PIP_BOTTOM_CENTER_X + 145, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            resized = _flip_horizontal(_resize_frame(cropped, (scaled_w, scaled_h)))
+            # Clip to canvas bounds
+            y = max(0, y)
+            x = max(0, x)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "REAR", (x + int(scaled_w * 0.41), y + scaled_h - 30))
             if back_emph and back_emph.border_color and back_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, PIP_BOTTOM_CENTER_X, PIP_BOTTOM_ROW_Y,
-                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      back_emph.border_color, back_emph.border_width)
 
+        # Bottom-right repeater: anchored at bottom-right, grows UP and LEFT
         if right_rep is not None:
-            resized = _resize_frame(right_rep, bottom_thumb_size)
-            canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
-                   PIP_BOTTOM_RIGHT_X:PIP_BOTTOM_RIGHT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
-            _draw_text(canvas, "R-REPEATER", (PIP_BOTTOM_RIGHT_X + 105, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            scale = _calc_pip_scale(right_rep_emph)
+            scaled_w = int(PIP_BOTTOM_THUMB_WIDTH * scale)
+            scaled_h = int(PIP_BOTTOM_THUMB_HEIGHT * scale)
+            # Anchor at bottom-right (grows up and left)
+            x = PIP_BOTTOM_RIGHT_X + PIP_BOTTOM_THUMB_WIDTH - scaled_w
+            y = PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - scaled_h
+            resized = _resize_frame(right_rep, (scaled_w, scaled_h))
+            # Clip to canvas bounds
+            x = max(0, x)
+            y = max(0, y)
+            draw_h = min(scaled_h, OUTPUT_HEIGHT - y)
+            draw_w = min(scaled_w, OUTPUT_WIDTH - x)
+            canvas[y:y+draw_h, x:x+draw_w] = resized[:draw_h, :draw_w]
+            _draw_text(canvas, "R-REPEATER", (x + int(scaled_w * 0.30), y + scaled_h - 30))
             if right_rep_emph and right_rep_emph.border_color and right_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
-                _draw_emphasis_border(canvas, PIP_BOTTOM_RIGHT_X, PIP_BOTTOM_ROW_Y,
-                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                _draw_emphasis_border(canvas, x, y, draw_w, draw_h,
                                      right_rep_emph.border_color, right_rep_emph.border_width)
 
         return canvas
