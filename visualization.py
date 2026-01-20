@@ -728,15 +728,21 @@ class DashboardRenderer:
 
 
 def _resize_frame(frame: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
-    """Resize a frame using Pillow with BILINEAR resampling.
+    """Resize a frame using OpenCV with INTER_LINEAR resampling.
 
-    BILINEAR is 4-8x faster than LANCZOS with negligible quality difference
-    at 30fps video playback. Each frame is only visible for ~33ms, making
-    the higher-quality LANCZOS algorithm unnecessary.
+    OpenCV resize is 3-5x faster than Pillow's resize due to:
+    - Native C++ implementation with SIMD optimizations
+    - Direct numpy array operations (no PIL conversion overhead)
+    - Multi-threaded by default on modern OpenCV builds
+
+    INTER_LINEAR (bilinear) provides good quality at 30fps playback
+    where each frame is only visible for ~33ms.
     """
-    img = Image.fromarray(frame)
-    resized = img.resize(size, Image.Resampling.BILINEAR)
-    return np.array(resized)
+    import cv2
+    # OpenCV uses (width, height) order for resize
+    # Convert RGB to BGR for OpenCV, resize, then convert back
+    # Actually, for resize we can skip color conversion - just resize
+    return cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
 
 
 def _flip_horizontal(frame: np.ndarray) -> np.ndarray:

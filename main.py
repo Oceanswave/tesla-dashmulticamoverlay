@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
+# CRITICAL: Set numba threading config BEFORE any imports
+# Prevents "workqueue threading layer" conflicts with ThreadPoolExecutor
+import os
+os.environ['NUMBA_NUM_THREADS'] = '1'
+
 import argparse
 import sys
-import os
 import glob
 import subprocess
 import multiprocessing
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Set, Callable
 from dataclasses import dataclass
 from pydantic import BaseModel, Field, field_validator
@@ -15,8 +20,8 @@ from sei_parser import extract_sei_data
 from visualization import DashboardRenderer, MapRenderer, composite_frame, apply_overlay, render_watermark, render_timestamp
 from emphasis import EmphasisCalculator
 from constants import OUTPUT_WIDTH, OUTPUT_HEIGHT, DASHBOARD_WIDTH, MAP_SIZE, DASHBOARD_Y, MAP_Y, MAP_X_MARGIN, TESLA_DASHCAM_FPS
-from color_grading import create_color_grader, ColorGrader
-from video_io import VideoCaptures, VideoWriterContext
+from color_grading import create_color_grader, ColorGrader, warmup_color_grading
+from video_io import VideoCaptures, VideoWriterContext, FrameBuffer
 from rich_console import (
     console,
     setup_rich_logging,
@@ -383,6 +388,88 @@ def _init_worker(counter):
     _shared_frame_counter = counter
 
 
+def _process_frame_batch(args):
+    """Process a single frame: compositing, overlays, color grading - all in one.
+
+    This is a PURE FUNCTION designed to be called from a thread pool for parallel processing.
+    All operations are stateless, using pre-computed values. Given the same inputs,
+    it will always produce the same output.
+
+    Args (unpacked from tuple):
+        frames: Dict of camera frames (front, left_rep, etc.)
+        cameras: Set of camera names to include
+        layout: Layout mode (grid, pip)
+        emphasis: Pre-computed EmphasisState for this frame
+        color_grader: ColorGrader instance or None
+        map_renderer: MapRenderer instance
+        map_data: Pre-computed tuple (heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot)
+        dash_renderer: DashboardRenderer instance
+        meta: SEI metadata for this frame
+        overlay_positions: Tuple of (dash_x, dash_y, map_x, map_y)
+        watermark_img: Pre-rendered watermark array or None
+        timestamp_data: Tuple of (timestamp_str, fps, frame_idx) or None
+
+    Returns:
+        Fully composited and processed canvas ready for writing
+    """
+    (frames, cameras, layout, emphasis, color_grader,
+     map_renderer, map_data, dash_renderer, meta,
+     overlay_positions, watermark_img, timestamp_data) = args
+
+    dash_x, dash_y, map_x, map_y = overlay_positions
+
+    canvas = composite_frame(
+        front=frames['front'],
+        left_rep=frames.get('left_rep'),
+        right_rep=frames.get('right_rep'),
+        back=frames.get('back'),
+        left_pill=frames.get('left_pill'),
+        right_pill=frames.get('right_pill'),
+        cameras=cameras,
+        layout=layout,
+        emphasis=emphasis
+    )
+
+    # Render and apply dashboard with actual telemetry (if available)
+    if meta:
+        dash_img = dash_renderer.render(meta)
+        apply_overlay(canvas, dash_img, dash_x, dash_y)
+
+    # Render and apply map using pre-computed smoothed values (parallel-safe)
+    if map_data is not None:
+        heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot = map_data
+        if lat != 0.0 or lon != 0.0:
+            map_img = map_renderer.render_stateless(
+                heading, lat, lon,
+                smooth_heading, zoom_window, crop_scale,
+                path_snapshot
+            )
+            apply_overlay(canvas, map_img, map_x, map_y)
+
+    # Apply color grading to composited frame
+    if color_grader is not None and color_grader.is_active:
+        canvas = color_grader.grade(canvas)
+
+    # Apply watermark (Lower Right)
+    if watermark_img is not None:
+        watermark_x = OUTPUT_WIDTH - watermark_img.shape[1] - 20
+        watermark_y = OUTPUT_HEIGHT - watermark_img.shape[0] - 20
+        apply_overlay(canvas, watermark_img, watermark_x, watermark_y)
+
+    # Apply timestamp (Lower Left)
+    if timestamp_data is not None:
+        timestamp_str, fps, current_frame_idx = timestamp_data
+        seconds = current_frame_idx / fps
+        render_timestamp(canvas, timestamp_str, seconds, scale=1.0)  # Scale handled by dash_renderer
+
+    return canvas
+
+
+# Number of threads for parallel frame processing within a clip
+# Use most CPU cores since the work is CPU-bound
+FRAME_PROCESSING_THREADS = max(4, multiprocessing.cpu_count() - 2)
+
+
 # Worker function must be at module level for multiprocessing
 def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map_style: str, north_up: bool,
                       history: List[Tuple[float, float]], cameras: Set[str], sei_data: dict,
@@ -410,11 +497,29 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
     """
     global _shared_frame_counter
 
+    # Warm up numba JIT in this worker process to avoid 3+ second delay on first frame
+    if color_grader is not None and color_grader.is_active and color_grader.lut is not None:
+        warmup_color_grading(color_grader.lut)
+
     # Build camera paths dict for the context manager
     camera_paths = build_camera_paths(clip, cameras)
 
+    # For PIP layout, read thumbnail cameras at reduced resolution
+    # This significantly reduces I/O overhead (reading 6 cameras at full res is slow)
+    # Thumbnails only need ~350x200, so we read at 640x360 (half res)
+    camera_sizes = None
+    if layout == "pip" and len(camera_paths) > 1:
+        # Front camera needs full resolution for fullscreen
+        # Other cameras are thumbnails - read at half resolution
+        camera_sizes = {}
+        for key in camera_paths:
+            if key != 'front':
+                # Half resolution: 640x360 instead of 1280x960
+                # Still larger than needed (~350x200 thumbnails) but much faster
+                camera_sizes[key] = (640, 360)
+
     # Use context managers for safe resource cleanup
-    with VideoCaptures(camera_paths) as caps:
+    with VideoCaptures(camera_paths, camera_sizes=camera_sizes) as caps:
         fps = caps['front'].fps
         # Tesla dashcam standard is 29.97 fps (NTSC: 30000/1001)
         # Using 30.0 causes cumulative drift at clip boundaries
@@ -450,88 +555,103 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
             if show_timestamp:
                 timestamp_str = parse_clip_timestamp(clip.timestamp_prefix)
 
+            # Pre-compute all smoothed map values for parallel rendering
+            # This allows map rendering to be included in the parallel batch
+            max_frames = len(sei_data) + 100  # +100 for interpolated frames without SEI
+            frame_gps_data = []  # (heading, lat, lon, speed) per frame
+            path_snapshots = []  # GPS history snapshot per frame
+            current_path = list(history)  # Start with initial history
+
+            for frame_idx in range(max_frames):
+                interp_lat, interp_lon, interp_heading = get_interpolated_gps(frame_idx)
+                meta = sei_data.get(frame_idx)
+                speed = meta.vehicle_speed_mps if meta else 0.0
+
+                frame_gps_data.append((interp_heading, interp_lat, interp_lon, speed))
+                path_snapshots.append(list(current_path))  # Snapshot current path state
+
+                # Update path for next frame (if valid GPS)
+                if meta and (abs(meta.latitude_deg) >= 0.001 or abs(meta.longitude_deg) >= 0.001):
+                    current_path.append((meta.latitude_deg, meta.longitude_deg, speed))
+
+            # Pre-compute smoothed values (heading, zoom, crop_scale) for all frames
+            smoothed_values = map_renderer.precompute_smoothed_values(frame_gps_data)
+
+            # Pre-compute emphasis values for all frames (removes per-frame state dependency)
+            precomputed_emphasis = emphasis_calculator.precompute_all(sei_data, max_frames) if emphasis_calculator else None
+
+            # Pre-fetch map tiles for the entire route (prevents network latency during rendering)
+            if map_style != 'simple':
+                gps_points = [(lat, lon) for _, lat, lon, _ in frame_gps_data if lat != 0.0 or lon != 0.0]
+                tiles_fetched = map_renderer.prefetch_tiles(gps_points)
+                logger.debug(f"Pre-fetched {tiles_fetched} map tiles for route")
+
             frame_idx = 0
             overlay_count = 0
-            while True:
-                frames = {}
-                ret, frames['front'] = caps['front'].read()
-                if not ret:
-                    break
 
-                for key in ['left_rep', 'right_rep', 'back', 'left_pill', 'right_pill']:
-                    if key in caps:
-                        _, frames[key] = caps[key].read()
-                    else:
-                        frames[key] = None
+            # Batch size for parallel processing (larger batch = less synchronization overhead)
+            # With read-ahead buffer, we can use larger batches without blocking
+            BATCH_SIZE = FRAME_PROCESSING_THREADS * 4
 
-                meta = sei_data.get(frame_idx)
+            # Pre-compute overlay positions (constant for all frames)
+            dash_x = (OUTPUT_WIDTH - dash_renderer.width) // 2
+            map_x = OUTPUT_WIDTH - map_renderer.size - MAP_X_MARGIN
+            overlay_positions = (dash_x, DASHBOARD_Y, map_x, MAP_Y)
 
-                # Compute camera emphasis based on driving context
-                emphasis = emphasis_calculator.compute(meta) if emphasis_calculator else None
+            # Use FrameBuffer for read-ahead (overlaps I/O with computation)
+            # Buffer size = 1.5x batch size to keep processing pipeline fed without excess memory
+            with FrameBuffer(caps, buffer_size=BATCH_SIZE + BATCH_SIZE // 2) as frame_buffer:
+                # Use ThreadPoolExecutor for parallel frame processing within a clip
+                with ThreadPoolExecutor(max_workers=FRAME_PROCESSING_THREADS) as executor:
+                    while True:
+                        # Read a batch of frames from buffer (read-ahead hides latency)
+                        frames_batch = frame_buffer.read_batch(BATCH_SIZE, timeout=2.0)
+                        if not frames_batch:
+                            break
 
-                canvas = composite_frame(
-                    front=frames['front'],
-                    left_rep=frames.get('left_rep'),
-                    right_rep=frames.get('right_rep'),
-                    back=frames.get('back'),
-                    left_pill=frames.get('left_pill'),
-                    right_pill=frames.get('right_pill'),
-                    cameras=cameras,
-                    layout=layout,
-                    emphasis=emphasis
-                )
+                        # Build args for batch processing
+                        batch_args = []
+                        for frames in frames_batch:
+                            current_idx = frame_idx + len(batch_args)
+                            meta = sei_data.get(current_idx)
 
-                # Apply color grading to composited frame (before overlays)
-                if color_grader is not None and color_grader.is_active:
-                    canvas = color_grader.grade(canvas)
+                            # Use pre-computed emphasis (removes per-frame state dependency)
+                            emphasis = precomputed_emphasis[current_idx] if precomputed_emphasis and current_idx < len(precomputed_emphasis) else None
 
-                # Get interpolated GPS for smooth map (works even without meta)
-                interp_lat, interp_lon, interp_heading = get_interpolated_gps(frame_idx)
+                            # Get pre-computed map data for this frame
+                            map_data = None
+                            if current_idx < len(smoothed_values):
+                                smooth_heading, zoom_window, crop_scale = smoothed_values[current_idx]
+                                heading, lat, lon, speed = frame_gps_data[current_idx]
+                                path_snapshot = path_snapshots[current_idx] if current_idx < len(path_snapshots) else []
+                                map_data = (heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot)
 
-                if meta:
-                    overlay_count += 1
-                    # Update path history with raw GPS and speed (for gradient coloring)
-                    map_renderer.update(meta.latitude_deg, meta.longitude_deg, meta.vehicle_speed_mps)
-                    # Render dashboard with actual telemetry (requires meta for speed, pedals, etc.)
-                    dash_img = dash_renderer.render(meta)
-                    dash_x = (OUTPUT_WIDTH - dash_renderer.width) // 2
-                    apply_overlay(canvas, dash_img, dash_x, DASHBOARD_Y)
+                            # Timestamp data (if enabled)
+                            ts_data = (timestamp_str, fps, current_idx) if timestamp_str else None
 
-                # Map overlay renders EVERY FRAME using interpolated GPS for smooth scrolling
-                # This is outside the `if meta:` block so it updates every frame
-                if interp_lat != 0.0 or interp_lon != 0.0:  # Skip if no GPS data at all
-                    # Get current speed for dynamic zoom (use 0 if no metadata)
-                    current_speed = meta.vehicle_speed_mps if meta else 0.0
-                    map_img = map_renderer.render(interp_heading, interp_lat, interp_lon, current_speed)
-                    map_x = OUTPUT_WIDTH - map_renderer.size - MAP_X_MARGIN
-                    apply_overlay(canvas, map_img, map_x, MAP_Y)
+                            # Build complete args tuple for pure function
+                            batch_args.append((
+                                frames, cameras, layout, emphasis, color_grader,
+                                map_renderer, map_data, dash_renderer, meta,
+                                overlay_positions, watermark_img, ts_data
+                            ))
 
-                # Watermark (Lower Right) - applied every frame, even without SEI data
-                if watermark_img is not None:
-                    watermark_x = OUTPUT_WIDTH - watermark_img.shape[1] - 20
-                    watermark_y = OUTPUT_HEIGHT - watermark_img.shape[0] - 20
-                    apply_overlay(canvas, watermark_img, watermark_x, watermark_y)
+                            if meta:
+                                overlay_count += 1
 
-                # Timestamp (Lower Left) - with running timecode
-                if timestamp_str:
-                    # Calculate timecode from frame index (HH:MM:SS:FF format)
-                    seconds = frame_idx / fps
-                    render_timestamp(canvas, timestamp_str, seconds, scale=overlay_scale)
+                        # Process batch in parallel - pure function returns complete frame
+                        results = list(executor.map(_process_frame_batch, batch_args))
 
-                out.write(canvas)
-                frame_idx += 1
+                        # Write results (only sequential operation remaining)
+                        for canvas in results:
+                            out.write(canvas)
 
-                # Update shared counter every 10 frames for responsive progress
-                if _shared_frame_counter is not None and frame_idx % 10 == 0:
-                    with _shared_frame_counter.get_lock():
-                        _shared_frame_counter.value += 10
+                        frame_idx += len(batch_args)
 
-            # Update any remaining frames not yet counted
-            if _shared_frame_counter is not None:
-                remainder = frame_idx % 10
-                if remainder > 0:
-                    with _shared_frame_counter.get_lock():
-                        _shared_frame_counter.value += remainder
+                        # Update shared counter for progress
+                        if _shared_frame_counter is not None:
+                            with _shared_frame_counter.get_lock():
+                                _shared_frame_counter.value += len(batch_args)
 
             # Debug: Show processing summary
             logger.debug(f"Clip {clip.timestamp_prefix}: Processed {frame_idx} frames, overlays applied to {overlay_count} frames")
@@ -609,6 +729,7 @@ def extract_telemetry(clip: ClipSet) -> Tuple[dict, List[Tuple[float, float]], i
 def concat_clips(temp_files: List[str], output_file: str, fps: float = TESLA_DASHCAM_FPS):
     import re
     import time
+    from video_io import detect_hw_encoder
 
     n = len(temp_files)
 
@@ -616,9 +737,44 @@ def concat_clips(temp_files: List[str], output_file: str, fps: float = TESLA_DAS
     total_frames = sum(get_video_frame_count(f) for f in temp_files)
     logger.debug(f"Total frames to concatenate: {total_frames}")
 
-    # Use concat FILTER (not demuxer) to properly reset timestamps
-    # The demuxer can drop frames when timestamps don't align
-    # The filter decodes, resets timestamps with setpts, and re-encodes
+    # Try stream copy first (much faster, ~5x speedup)
+    # This works when all clips have compatible codec/resolution/fps
+    # which they should since we created them with the same settings
+    concat_list_path = os.path.join(os.path.dirname(temp_files[0]), "concat_list.txt")
+    with open(concat_list_path, 'w') as f:
+        for temp_file in temp_files:
+            # FFmpeg concat demuxer format
+            f.write(f"file '{os.path.abspath(temp_file)}'\n")
+
+    # Try stream copy with concat demuxer
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_list_path,
+        "-c:v", "copy",  # Stream copy - no re-encoding!
+        "-movflags", "+faststart",
+        output_file
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            # Verify output has expected frame count
+            output_frames = get_video_frame_count(output_file)
+            if abs(output_frames - total_frames) < 10:  # Allow small variance
+                logger.debug(f"Concatenation via stream copy successful: {output_frames} frames")
+                os.remove(concat_list_path)
+                return
+            else:
+                logger.debug(f"Stream copy frame count mismatch: {output_frames} vs {total_frames}")
+    except (subprocess.TimeoutExpired, Exception) as e:
+        logger.debug(f"Stream copy failed, falling back to re-encode: {e}")
+
+    os.remove(concat_list_path)
+
+    # Fallback: Use concat FILTER with re-encoding for timestamp alignment
+    # This is slower but handles timestamp discontinuities
+    logger.debug("Using concat filter with re-encoding (slower)")
 
     # Build filter graph: reset timestamps for each input, then concat
     filter_parts = []
@@ -633,6 +789,15 @@ def concat_clips(temp_files: List[str], output_file: str, fps: float = TESLA_DAS
 
     filter_complex = ";".join(filter_parts)
 
+    # Use hardware encoder if available for faster re-encoding
+    hw_encoder = detect_hw_encoder()
+    if hw_encoder == "h264_videotoolbox":
+        encoder_args = ["-c:v", "h264_videotoolbox", "-b:v", "10M"]
+    elif hw_encoder == "h264_nvenc":
+        encoder_args = ["-c:v", "h264_nvenc", "-preset", "fast", "-b:v", "10M"]
+    else:
+        encoder_args = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+
     # Build command with all input files
     cmd = ["ffmpeg", "-y", "-fflags", "+genpts+igndts", "-progress", "pipe:2"]
     for temp_file in temp_files:
@@ -641,7 +806,7 @@ def concat_clips(temp_files: List[str], output_file: str, fps: float = TESLA_DAS
     cmd.extend([
         "-filter_complex", filter_complex,
         "-map", "[outv]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+    ] + encoder_args + [
         "-r", str(fps),
         "-vsync", "cfr",
         "-pix_fmt", "yuv420p",
@@ -748,10 +913,256 @@ def concat_clips(temp_files: List[str], output_file: str, fps: float = TESLA_DAS
         sys.exit(1)
             
 import tempfile
+import threading
+from queue import Queue, Empty
 
 # Wrapper for imap since it only accepts one argument
 def process_clip_wrapper(args):
     return process_clip_task(*args)
+
+
+def process_clips_parallel(clips_data: List[tuple], color_grader: Optional[ColorGrader],
+                           num_workers: int, progress_callback) -> List[str]:
+    """
+    Process multiple clips with parallel reading and processing.
+
+    Optimized architecture:
+    1. Reader threads feed frames into a shared queue (overlapping I/O)
+    2. ThreadPoolExecutor processes frames in parallel (all workers utilized)
+    3. Results buffered per-clip, written after all processing done (no writer thread overhead)
+
+    Args:
+        clips_data: List of (clip, temp_file, overlay_scale, map_style, north_up,
+                            history, cameras, sei_data, watermark_path, show_timestamp,
+                            layout, enable_emphasis) tuples
+        color_grader: Shared color grader
+        num_workers: Number of processing threads
+        progress_callback: Function to call with frames_done count
+
+    Returns:
+        List of output temp files
+    """
+    from video_io import VideoCaptures, VideoWriterContext
+    from concurrent.futures import as_completed
+
+    # Warm up color grading
+    if color_grader and color_grader.is_active and color_grader.lut is not None:
+        warmup_color_grading(color_grader.lut)
+
+    # Shared state
+    frame_queue = Queue(maxsize=num_workers * 8)  # Larger buffer for better overlap
+    frames_done = [0]
+    clips_done_reading = [0]
+
+    def reader_thread(clip_idx, clip, camera_paths, cameras, sei_data, history,
+                      overlay_scale, map_style, north_up, watermark_path, show_timestamp,
+                      layout, enable_emphasis):
+        """Read frames from one clip and push to shared queue."""
+        # Setup per-clip renderers
+        dash_renderer = DashboardRenderer(scale=overlay_scale)
+        map_renderer = MapRenderer(
+            scale=overlay_scale,
+            history=list(history),
+            map_style=map_style,
+            heading_up=not north_up
+        )
+        emphasis_calculator = EmphasisCalculator() if enable_emphasis else None
+
+        # Build GPS interpolator
+        get_interpolated_gps = build_gps_interpolator(sei_data)
+
+        # Pre-render watermark
+        watermark_img = None
+        if watermark_path:
+            watermark_img = render_watermark(watermark_path, max_size=int(150 * overlay_scale))
+
+        timestamp_str = None
+        if show_timestamp:
+            timestamp_str = parse_clip_timestamp(clip.timestamp_prefix)
+
+        # Pre-compute smoothed values
+        max_frames = len(sei_data) + 100
+        frame_gps_data = []
+        path_snapshots = []
+        current_path = list(history)
+
+        for frame_idx in range(max_frames):
+            interp_lat, interp_lon, interp_heading = get_interpolated_gps(frame_idx)
+            meta = sei_data.get(frame_idx)
+            speed = meta.vehicle_speed_mps if meta else 0.0
+            frame_gps_data.append((interp_heading, interp_lat, interp_lon, speed))
+            path_snapshots.append(list(current_path))
+            if meta and (abs(meta.latitude_deg) >= 0.001 or abs(meta.longitude_deg) >= 0.001):
+                current_path.append((meta.latitude_deg, meta.longitude_deg, speed))
+
+        smoothed_values = map_renderer.precompute_smoothed_values(frame_gps_data)
+        precomputed_emphasis = emphasis_calculator.precompute_all(sei_data, max_frames) if emphasis_calculator else None
+
+        # Pre-fetch tiles
+        if map_style != 'simple':
+            gps_points = [(lat, lon) for _, lat, lon, _ in frame_gps_data if lat != 0.0 or lon != 0.0]
+            map_renderer.prefetch_tiles(gps_points)
+
+        # Overlay positions
+        dash_x = (OUTPUT_WIDTH - dash_renderer.width) // 2
+        map_x = OUTPUT_WIDTH - map_renderer.size - MAP_X_MARGIN
+        overlay_positions = (dash_x, DASHBOARD_Y, map_x, MAP_Y)
+
+        # For PIP layout, read thumbnails at reduced resolution
+        camera_sizes = None
+        if layout == "pip" and len(camera_paths) > 1:
+            camera_sizes = {k: (640, 360) for k in camera_paths if k != 'front'}
+
+        # Read frames
+        with VideoCaptures(camera_paths, camera_sizes) as caps:
+            fps = caps['front'].fps
+            if fps == 0 or fps > 60:
+                fps = 29.97
+
+            frame_idx = 0
+            while True:
+                ret, frames = caps.read_all_parallel()
+                if not ret:
+                    break
+
+                meta = sei_data.get(frame_idx)
+                emphasis = precomputed_emphasis[frame_idx] if precomputed_emphasis and frame_idx < len(precomputed_emphasis) else None
+
+                map_data = None
+                if frame_idx < len(smoothed_values):
+                    smooth_heading, zoom_window, crop_scale = smoothed_values[frame_idx]
+                    heading, lat, lon, speed = frame_gps_data[frame_idx]
+                    path_snapshot = path_snapshots[frame_idx] if frame_idx < len(path_snapshots) else []
+                    map_data = (heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot)
+
+                ts_data = (timestamp_str, fps, frame_idx) if timestamp_str else None
+
+                # Push to queue
+                frame_queue.put((
+                    clip_idx, frame_idx, frames, cameras, layout, emphasis, color_grader,
+                    map_renderer, map_data, dash_renderer, meta,
+                    overlay_positions, watermark_img, ts_data
+                ))
+                frame_idx += 1
+
+        # Signal this clip is done reading
+        frame_queue.put((clip_idx, -1, None, None, None, None, None, None, None, None, None, None, None, None))
+
+    def process_frame(args):
+        """Process a single frame - pure function."""
+        (clip_idx, frame_idx, frames, cameras, layout, emphasis, color_grader,
+         map_renderer, map_data, dash_renderer, meta,
+         overlay_positions, watermark_img, ts_data) = args
+
+        dash_x, dash_y, map_x, map_y = overlay_positions
+
+        canvas = composite_frame(
+            front=frames['front'],
+            left_rep=frames.get('left_rep'),
+            right_rep=frames.get('right_rep'),
+            back=frames.get('back'),
+            left_pill=frames.get('left_pill'),
+            right_pill=frames.get('right_pill'),
+            cameras=cameras,
+            layout=layout,
+            emphasis=emphasis
+        )
+
+        if meta:
+            dash_img = dash_renderer.render(meta)
+            apply_overlay(canvas, dash_img, dash_x, dash_y)
+
+        if map_data is not None:
+            heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot = map_data
+            if lat != 0.0 or lon != 0.0:
+                map_img = map_renderer.render_stateless(
+                    heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot
+                )
+                apply_overlay(canvas, map_img, map_x, map_y)
+
+        if color_grader is not None and color_grader.is_active:
+            canvas = color_grader.grade(canvas)
+
+        if watermark_img is not None:
+            watermark_x = OUTPUT_WIDTH - watermark_img.shape[1] - 20
+            watermark_y = OUTPUT_HEIGHT - watermark_img.shape[0] - 20
+            apply_overlay(canvas, watermark_img, watermark_x, watermark_y)
+
+        if ts_data is not None:
+            timestamp_str, fps, current_frame_idx = ts_data
+            seconds = current_frame_idx / fps
+            render_timestamp(canvas, timestamp_str, seconds, scale=1.0)
+
+        return clip_idx, frame_idx, canvas
+
+    # Start reader threads for all clips
+    reader_threads = []
+    temp_files = []
+    for clip_idx, data in enumerate(clips_data):
+        (clip, temp_file, overlay_scale, map_style, north_up, history, cameras,
+         sei_data, watermark_path, show_timestamp, layout, enable_emphasis) = data
+        temp_files.append(temp_file)
+        camera_paths = build_camera_paths(clip, cameras)
+        t = threading.Thread(target=reader_thread, args=(
+            clip_idx, clip, camera_paths, cameras, sei_data, history,
+            overlay_scale, map_style, north_up, watermark_path, show_timestamp,
+            layout, enable_emphasis
+        ))
+        reader_threads.append(t)
+        t.start()
+
+    # Collect results per clip for ordered writing
+    clip_results = [[] for _ in clips_data]
+
+    import time as _time
+    process_start = _time.time()
+
+    # Process frames with thread pool
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}  # future -> (clip_idx, frame_idx)
+
+        while clips_done_reading[0] < len(clips_data) or futures:
+            # Submit new work from queue
+            try:
+                while len(futures) < num_workers * 4:  # Keep workers busy
+                    item = frame_queue.get(timeout=0.01)
+                    clip_idx = item[0]
+                    frame_idx = item[1]
+
+                    if frame_idx == -1:  # End marker
+                        clips_done_reading[0] += 1
+                        continue
+
+                    future = executor.submit(process_frame, item)
+                    futures[future] = (clip_idx, frame_idx)
+            except Empty:
+                pass
+
+            # Collect completed results
+            done_futures = [f for f in futures if f.done()]
+            for f in done_futures:
+                clip_idx, frame_idx = futures.pop(f)
+                canvas = f.result()[2]
+                clip_results[clip_idx].append((frame_idx, canvas))
+                frames_done[0] += 1
+                progress_callback(frames_done[0])
+
+    # Wait for readers to finish
+    for t in reader_threads:
+        t.join()
+
+    logger.debug(f"Process phase: {_time.time() - process_start:.1f}s ({frames_done[0]} frames)")
+
+    # Write all results in order (single sequential pass per clip)
+    for clip_idx, results in enumerate(clip_results):
+        results.sort(key=lambda x: x[0])
+        temp_file = temp_files[clip_idx]
+        with VideoWriterContext(temp_file, 0, TESLA_DASHCAM_FPS, (OUTPUT_WIDTH, OUTPUT_HEIGHT)) as out:
+            for frame_idx, canvas in results:
+                out.write(canvas)
+        clip_results[clip_idx] = None
+
+    return temp_files
 
 def main():
     config = parse_args()
@@ -823,7 +1234,7 @@ def main():
         args_list = []
         temp_files = []
         for i, clip in enumerate(config.playlist):
-            temp_file = os.path.join(temp_dir, f"temp_clip_{i}.mp4")  # H.264 in MP4 container
+            temp_file = os.path.join(temp_dir, f"temp_clip_{i}.mp4")
             temp_files.append(temp_file)
             args_list.append((
                 clip, temp_file, config.overlay_scale, config.map_style, config.north_up,
@@ -836,6 +1247,10 @@ def main():
         frame_counter = multiprocessing.Value('i', 0)
         import time
 
+        # Use parallel ThreadPool architecture for better CPU utilization
+        # (threads share memory, no serialization overhead)
+        use_parallel = len(config.playlist) <= num_processes
+
         with create_render_progress() as progress:
             task = progress.add_task(
                 "Rendering",
@@ -843,51 +1258,62 @@ def main():
                 status=f"Starting {num_processes} workers..."
             )
 
-            clips_done = 0
-            with multiprocessing.Pool(
-                processes=num_processes,
-                initializer=_init_worker,
-                initargs=(frame_counter,)
-            ) as pool:
-                # Use imap_unordered for faster completion notification
-                result_iter = pool.imap_unordered(process_clip_wrapper, args_list)
-                start_time = time.time()
+            start_time = time.time()
+            frames_done = [0]
 
-                # Poll for progress while processing
-                failed_clips = []
-                while clips_done < len(args_list):
-                    # Check for completed clips (non-blocking with timeout)
-                    try:
-                        _ = result_iter.next(timeout=0.05)  # Faster polling
-                        clips_done += 1
-                    except StopIteration:
-                        break
-                    except multiprocessing.TimeoutError:
-                        pass  # No result ready yet, just update progress
-                    except Exception as e:
-                        # Worker process failed - log error and continue with remaining clips
-                        logger.error(f"Worker process failed: {e}")
-                        failed_clips.append(str(e))
-                        clips_done += 1  # Count as done to avoid hanging
+            def update_progress(count):
+                frames_done[0] = count
+                elapsed = time.time() - start_time
+                if count == 0:
+                    status = f"Initializing... ({elapsed:.0f}s)"
+                else:
+                    render_fps = count / elapsed if elapsed > 0 else 0
+                    speed = render_fps / 29.97
+                    status = f"{render_fps:.0f} fps • {speed:.1f}x"
+                progress.update(task, completed=count, status=status)
 
-                    # Update progress with current frame count
-                    current_frames = frame_counter.value
-                    elapsed = time.time() - start_time
+            if use_parallel:
+                # ThreadPool-based parallel processing (better for few clips)
+                # Remove color_grader from args_list for process_clips_parallel
+                clips_data = []
+                for i, clip in enumerate(config.playlist):
+                    temp_file = os.path.join(temp_dir, f"temp_clip_{i}.mp4")
+                    clips_data.append((
+                        clip, temp_file, config.overlay_scale, config.map_style, config.north_up,
+                        clip_histories[i], config.cameras, clip_sei_data[i],
+                        config.watermark_path, config.show_timestamp, config.layout,
+                        config.enable_emphasis
+                    ))
 
-                    # Show appropriate status based on progress
-                    if current_frames == 0:
-                        status = f"Initializing... ({elapsed:.0f}s)"
-                    else:
-                        render_fps = current_frames / elapsed if elapsed > 0 else 0
-                        # Speed is rendering fps / video fps (29.97 for Tesla dashcam)
-                        speed = render_fps / 29.97
-                        status = f"{render_fps:.0f} fps • {speed:.1f}x"
+                temp_files = process_clips_parallel(
+                    clips_data, color_grader, num_processes, update_progress
+                )
+            else:
+                # Original multiprocessing.Pool approach (better for many clips)
+                clips_done = 0
+                with multiprocessing.Pool(
+                    processes=num_processes,
+                    initializer=_init_worker,
+                    initargs=(frame_counter,)
+                ) as pool:
+                    result_iter = pool.imap_unordered(process_clip_wrapper, args_list)
 
-                    progress.update(
-                        task,
-                        completed=current_frames,
-                        status=status
-                    )
+                    failed_clips = []
+                    while clips_done < len(args_list):
+                        try:
+                            _ = result_iter.next(timeout=0.05)
+                            clips_done += 1
+                        except StopIteration:
+                            break
+                        except multiprocessing.TimeoutError:
+                            pass
+                        except Exception as e:
+                            logger.error(f"Worker process failed: {e}")
+                            failed_clips.append(str(e))
+                            clips_done += 1
+
+                        current_frames = frame_counter.value
+                        update_progress(current_frames)
 
         # 3. Concatenate
         print_phase(3, 3, "Concatenating clips")

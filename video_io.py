@@ -12,6 +12,9 @@ import subprocess
 import logging
 import platform
 import numpy as np
+import threading
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,10 @@ logger = logging.getLogger(__name__)
 # Cache for detected hardware encoder
 _hw_encoder_cache: Optional[str] = None
 _hw_encoder_checked: bool = False
+
+# Cache for detected hardware decoder
+_hw_decoder_cache: Optional[str] = None
+_hw_decoder_checked: bool = False
 
 
 def detect_hw_encoder() -> Optional[str]:
@@ -77,6 +84,61 @@ def detect_hw_encoder() -> Optional[str]:
     return None
 
 
+def _detect_hw_decoder() -> Optional[str]:
+    """
+    Detect available hardware decoder/acceleration for H.264.
+
+    Checks for platform-specific hardware accelerators:
+    - macOS: videotoolbox (Apple VideoToolbox)
+    - NVIDIA: cuda (NVIDIA CUDA/NVDEC)
+    - AMD/Intel: vaapi (VA-API on Linux)
+
+    Returns:
+        Hardware accelerator name if available, None if only software decoding
+    """
+    global _hw_decoder_cache, _hw_decoder_checked
+
+    if _hw_decoder_checked:
+        return _hw_decoder_cache
+
+    _hw_decoder_checked = True
+
+    # Platform-specific accelerator priority
+    system = platform.system()
+    if system == "Darwin":
+        candidates = ["videotoolbox"]
+    elif system == "Linux":
+        candidates = ["cuda", "vaapi"]
+    elif system == "Windows":
+        candidates = ["cuda", "d3d11va", "qsv"]
+    else:
+        candidates = []
+
+    # Test each accelerator
+    for hwaccel in candidates:
+        try:
+            cmd = [
+                "ffmpeg", "-v", "error",
+                "-hwaccel", hwaccel,
+                "-f", "lavfi", "-i", "nullsrc=s=64x64:d=1",
+                "-f", "null", "-"
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"Hardware decoder detected: {hwaccel}")
+                _hw_decoder_cache = hwaccel
+                return hwaccel
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+
+    logger.debug("No hardware decoder available, using software decoding")
+    return None
+
+
 def get_video_info(path: str) -> Tuple[int, int, float, int]:
     """
     Get video metadata using ffprobe.
@@ -118,10 +180,20 @@ class FFmpegReader:
     Context manager for reading video frames via FFmpeg pipe.
 
     Decodes video to raw RGB24 frames and provides them as numpy arrays.
+    Supports optional output scaling for reduced I/O (e.g., thumbnails).
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, output_size: Optional[Tuple[int, int]] = None):
+        """
+        Initialize FFmpeg reader.
+
+        Args:
+            path: Path to video file
+            output_size: Optional (width, height) to scale output frames.
+                        If None, uses native video resolution.
+        """
         self.path = path
+        self.output_size = output_size
         self.process: Optional[subprocess.Popen] = None
         self.width = 0
         self.height = 0
@@ -131,17 +203,39 @@ class FFmpegReader:
 
     def __enter__(self) -> 'FFmpegReader':
         # Get video info first
-        self.width, self.height, self.fps, self.frame_count = get_video_info(self.path)
+        native_width, native_height, self.fps, self.frame_count = get_video_info(self.path)
+
+        # Use output_size if specified, otherwise native resolution
+        if self.output_size:
+            self.width, self.height = self.output_size
+        else:
+            self.width, self.height = native_width, native_height
+
         self._frame_size = self.width * self.height * 3
 
-        # Start FFmpeg process
+        # Start FFmpeg process with hardware acceleration if available
+        # VideoToolbox (macOS), CUDA/NVDEC (NVIDIA), VAAPI (Linux AMD/Intel)
         cmd = [
             "ffmpeg", "-v", "error",
-            "-i", self.path,
+        ]
+
+        # Try hardware acceleration based on platform
+        # Just use -hwaccel; the output will be transferred to CPU for RGB conversion
+        hwaccel = _detect_hw_decoder()
+        if hwaccel:
+            cmd.extend(["-hwaccel", hwaccel])
+
+        cmd.extend(["-i", self.path])
+
+        # Add scale filter if output size is different from native
+        if self.output_size and (self.width != native_width or self.height != native_height):
+            cmd.extend(["-vf", f"scale={self.width}:{self.height}"])
+
+        cmd.extend([
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
             "-"
-        ]
+        ])
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -201,19 +295,36 @@ class VideoCaptures:
 
     Opens FFmpegReader objects for the provided camera paths and ensures all are
     properly released on exit, even if an exception occurs.
+
+    Supports parallel frame reading across all cameras for better I/O throughput.
+    Supports per-camera output sizes for reduced I/O (e.g., read thumbnails at low res).
     """
 
-    def __init__(self, camera_paths: Dict[str, str]):
+    def __init__(self, camera_paths: Dict[str, str],
+                 camera_sizes: Optional[Dict[str, Tuple[int, int]]] = None):
+        """
+        Initialize video captures for multiple cameras.
+
+        Args:
+            camera_paths: Dict mapping camera key to file path
+            camera_sizes: Optional dict mapping camera key to (width, height).
+                         Cameras not in this dict use native resolution.
+        """
         if 'front' not in camera_paths:
             raise ValueError("'front' camera path is required")
         self.camera_paths = camera_paths
+        self.camera_sizes = camera_sizes or {}
         self.readers: Dict[str, FFmpegReader] = {}
         self._contexts: list = []
+        # Thread pool for parallel reads (one thread per camera)
+        self._read_pool: Optional[ThreadPoolExecutor] = None
 
-    def __enter__(self) -> Dict[str, FFmpegReader]:
+    def __enter__(self) -> 'VideoCaptures':
         for key, path in self.camera_paths.items():
             try:
-                reader = FFmpegReader(path)
+                # Get output size for this camera (None = native resolution)
+                output_size = self.camera_sizes.get(key)
+                reader = FFmpegReader(path, output_size=output_size)
                 ctx = reader.__enter__()
                 self._contexts.append(reader)
                 self.readers[key] = ctx
@@ -225,9 +336,61 @@ class VideoCaptures:
                     raise RuntimeError(f"Failed to open front camera: {path}") from e
                 else:
                     logger.warning(f"Failed to open {key} camera: {path} - {e}")
-        return self.readers
+        # Create thread pool for parallel reads
+        self._read_pool = ThreadPoolExecutor(max_workers=len(self.readers))
+        return self
+
+    def __getitem__(self, key: str) -> FFmpegReader:
+        """Allow dict-like access to readers."""
+        return self.readers[key]
+
+    def __contains__(self, key: str) -> bool:
+        """Allow 'in' operator."""
+        return key in self.readers
+
+    def keys(self):
+        """Return reader keys."""
+        return self.readers.keys()
+
+    def read_all_parallel(self) -> Tuple[bool, Dict[str, Optional[np.ndarray]]]:
+        """
+        Read one frame from all cameras in parallel.
+
+        Returns:
+            Tuple of (success, frames_dict) where success is True if front camera read succeeded
+        """
+        if self._read_pool is None:
+            return False, {}
+
+        # Submit read tasks for all cameras in parallel
+        def read_camera(key: str) -> Tuple[str, bool, Optional[np.ndarray]]:
+            reader = self.readers.get(key)
+            if reader is None:
+                return key, False, None
+            ret, frame = reader.read()
+            return key, ret, frame
+
+        # Submit all reads in parallel
+        futures = [self._read_pool.submit(read_camera, key) for key in self.readers.keys()]
+
+        # Collect results
+        frames: Dict[str, Optional[np.ndarray]] = {}
+        front_success = False
+
+        for future in futures:
+            key, ret, frame = future.result()
+            if key == 'front':
+                front_success = ret
+            frames[key] = frame if ret else None
+
+        return front_success, frames
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # Shutdown thread pool
+        if self._read_pool:
+            self._read_pool.shutdown(wait=False)
+            self._read_pool = None
+
         for reader in self._contexts:
             try:
                 reader.__exit__(exc_type, exc_val, exc_tb)
@@ -393,4 +556,108 @@ class VideoWriterContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._writer:
             self._writer.__exit__(exc_type, exc_val, exc_tb)
+        return False
+
+
+class FrameBuffer:
+    """
+    Async read-ahead buffer for VideoCaptures.
+
+    Reads frames in a background thread while the main thread processes,
+    overlapping I/O with computation for better throughput.
+
+    This hides frame reading latency by always having the next batch ready.
+    """
+
+    def __init__(self, caps: VideoCaptures, buffer_size: int = 32):
+        """
+        Initialize frame buffer.
+
+        Args:
+            caps: VideoCaptures instance to read from
+            buffer_size: Max frames to buffer (higher = more memory, better overlap)
+        """
+        self.caps = caps
+        self.buffer: Queue = Queue(maxsize=buffer_size)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._read_count = 0
+
+    def start(self) -> 'FrameBuffer':
+        """Start the background reader thread."""
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _read_loop(self):
+        """Background thread: continuously read frames into buffer."""
+        while not self._stop.is_set():
+            try:
+                ret, frames = self.caps.read_all_parallel()
+                if not ret:
+                    # End of video - put sentinel and exit
+                    self.buffer.put((False, None))
+                    break
+                self.buffer.put((True, frames))
+                self._read_count += 1
+            except Exception as e:
+                logger.warning(f"FrameBuffer read error: {e}")
+                self.buffer.put((False, None))
+                break
+
+    def read(self, timeout: float = 5.0) -> Tuple[bool, Optional[Dict[str, np.ndarray]]]:
+        """
+        Read next frame from buffer.
+
+        Args:
+            timeout: Max seconds to wait for frame
+
+        Returns:
+            Tuple of (success, frames_dict)
+        """
+        try:
+            return self.buffer.get(timeout=timeout)
+        except Empty:
+            return False, None
+
+    def read_batch(self, batch_size: int, timeout: float = 1.0) -> List[Dict[str, np.ndarray]]:
+        """
+        Read a batch of frames from buffer.
+
+        Args:
+            batch_size: Max frames to read
+            timeout: Max seconds to wait for each frame
+
+        Returns:
+            List of frame dictionaries (may be shorter than batch_size at end of video)
+        """
+        batch = []
+        for _ in range(batch_size):
+            try:
+                ret, frames = self.buffer.get(timeout=timeout)
+                if not ret:
+                    break
+                batch.append(frames)
+            except Empty:
+                break
+        return batch
+
+    def stop(self):
+        """Stop the background reader thread."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    @property
+    def frames_read(self) -> int:
+        """Number of frames read by background thread."""
+        return self._read_count
+
+    def __enter__(self) -> 'FrameBuffer':
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
         return False

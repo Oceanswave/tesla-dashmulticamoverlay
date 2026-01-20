@@ -250,12 +250,14 @@ class TestFFmpegReaderUnit:
         assert reader.height == 0
         assert reader.fps == 0.0
 
+    @patch('video_io._detect_hw_decoder')
     @patch('video_io.get_video_info')
     @patch('video_io.subprocess.Popen')
-    def test_enter_gets_video_info(self, mock_popen, mock_info):
+    def test_enter_gets_video_info(self, mock_popen, mock_info, mock_hwdec):
         """__enter__ should get video info and start process."""
         mock_info.return_value = (1920, 1080, 29.97, 900)
         mock_popen.return_value = MagicMock()
+        mock_hwdec.return_value = None  # No hardware decoder for test
 
         reader = FFmpegReader("/path/to/video.mp4")
         result = reader.__enter__()
@@ -302,13 +304,15 @@ class TestFFmpegReaderUnit:
         assert success is False
         assert frame is None
 
+    @patch('video_io._detect_hw_decoder')
     @patch('video_io.get_video_info')
     @patch('video_io.subprocess.Popen')
-    def test_exit_terminates_process(self, mock_popen, mock_info):
+    def test_exit_terminates_process(self, mock_popen, mock_info, mock_hwdec):
         """__exit__ should terminate the process."""
         mock_info.return_value = (1920, 1080, 29.97, 900)
         mock_process = MagicMock()
         mock_popen.return_value = mock_process
+        mock_hwdec.return_value = None
 
         reader = FFmpegReader("/path/to/video.mp4")
         reader.__enter__()
@@ -317,14 +321,16 @@ class TestFFmpegReaderUnit:
         mock_process.terminate.assert_called_once()
         mock_process.wait.assert_called_once()
 
+    @patch('video_io._detect_hw_decoder')
     @patch('video_io.get_video_info')
     @patch('video_io.subprocess.Popen')
-    def test_exit_kills_on_timeout(self, mock_popen, mock_info):
+    def test_exit_kills_on_timeout(self, mock_popen, mock_info, mock_hwdec):
         """__exit__ should kill process if terminate times out."""
         mock_info.return_value = (1920, 1080, 29.97, 900)
         mock_process = MagicMock()
         mock_process.wait.side_effect = Exception("Timeout")
         mock_popen.return_value = mock_process
+        mock_hwdec.return_value = None
 
         reader = FFmpegReader("/path/to/video.mp4")
         reader.__enter__()

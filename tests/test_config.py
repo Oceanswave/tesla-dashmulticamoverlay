@@ -380,15 +380,23 @@ class TestSetupLogging:
 class TestConcatClips:
     """Tests for concat_clips function."""
 
+    @patch('video_io.detect_hw_encoder')
     @patch('main.subprocess.Popen')
+    @patch('main.subprocess.run')
     @patch('main.get_video_frame_count')
     @patch('main.create_concat_progress')
-    def test_calls_ffmpeg_with_correct_args(self, mock_progress, mock_frame_count, mock_popen):
+    def test_calls_ffmpeg_with_correct_args(self, mock_progress, mock_frame_count, mock_run, mock_popen, mock_hw_encoder):
         """concat_clips should call ffmpeg with correct arguments."""
         from main import concat_clips
 
         # Mock frame count
         mock_frame_count.return_value = 100
+
+        # Mock hw encoder detection
+        mock_hw_encoder.return_value = None
+
+        # Mock subprocess.run (stream copy attempt) - fail to trigger fallback
+        mock_run.return_value = MagicMock(returncode=1)
 
         # Mock progress context manager
         mock_progress_instance = MagicMock()
@@ -397,31 +405,38 @@ class TestConcatClips:
         mock_progress_instance.add_task = MagicMock(return_value=1)
         mock_progress.return_value = mock_progress_instance
 
-        # Mock subprocess Popen - return success for ffmpeg
+        # Mock subprocess Popen - return success for ffmpeg re-encode
         mock_process = MagicMock()
         mock_process.poll.return_value = 0  # Process finished with exit code 0
         mock_process.wait.return_value = 0
         mock_process.returncode = 0  # Explicitly set successful exit code
-        mock_process.stderr = MagicMock()
-        mock_process.stderr.readline.return_value = b""  # Empty line signals end
+        mock_process.stderr = iter([])  # Empty iterator for stderr lines
         mock_popen.return_value = mock_process
 
         concat_clips(["/tmp/clip1.mp4", "/tmp/clip2.mp4"], "/tmp/output.mp4")
 
-        # Verify Popen was called with ffmpeg command
+        # Verify Popen was called with ffmpeg command (re-encode path)
         mock_popen.assert_called_once()
         call_args = mock_popen.call_args[0][0]
         assert call_args[0] == "ffmpeg"
         assert "/tmp/output.mp4" in call_args
 
+    @patch('video_io.detect_hw_encoder')
     @patch('main.subprocess.Popen')
+    @patch('main.subprocess.run')
     @patch('main.get_video_frame_count')
     @patch('main.create_concat_progress')
-    def test_handles_single_clip(self, mock_progress, mock_frame_count, mock_popen):
+    def test_handles_single_clip(self, mock_progress, mock_frame_count, mock_run, mock_popen, mock_hw_encoder):
         """concat_clips with single clip should still work."""
         from main import concat_clips
 
         mock_frame_count.return_value = 100
+
+        # Mock hw encoder detection
+        mock_hw_encoder.return_value = None
+
+        # Mock subprocess.run (stream copy attempt) - fail to trigger fallback
+        mock_run.return_value = MagicMock(returncode=1)
 
         # Mock progress context manager
         mock_progress_instance = MagicMock()
@@ -435,8 +450,7 @@ class TestConcatClips:
         mock_process.poll.return_value = 0  # Process finished
         mock_process.wait.return_value = 0
         mock_process.returncode = 0  # Explicitly set successful exit code
-        mock_process.stderr = MagicMock()
-        mock_process.stderr.readline.return_value = b""
+        mock_process.stderr = iter([])  # Empty iterator for stderr lines
         mock_popen.return_value = mock_process
 
         concat_clips(["/tmp/clip1.mp4"], "/tmp/output.mp4")

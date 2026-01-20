@@ -253,3 +253,23 @@ class EmphasisCalculator:
         """Reset smoothed state to zero (e.g., between clips)."""
         self._smoothed = {cam: 0.0 for cam in self.CAMERAS}
         self._last_colors = {cam: None for cam in self.CAMERAS}
+
+    def precompute_all(self, sei_data: dict, max_frames: int) -> list:
+        """Pre-compute emphasis states for all frames.
+
+        This enables parallel frame processing by removing per-frame state dependencies.
+
+        Args:
+            sei_data: Dict mapping frame_idx to SEI metadata
+            max_frames: Number of frames to pre-compute
+
+        Returns:
+            List of EmphasisState objects, one per frame
+        """
+        self.reset()  # Start fresh
+        results = []
+        for frame_idx in range(max_frames):
+            meta = sei_data.get(frame_idx)
+            state = self.compute(meta)
+            results.append(state)
+        return results
