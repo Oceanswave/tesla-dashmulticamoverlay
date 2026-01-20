@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from sei_parser import extract_sei_data
 from visualization import DashboardRenderer, MapRenderer, composite_frame, apply_overlay, render_watermark, render_timestamp
 from constants import OUTPUT_WIDTH, OUTPUT_HEIGHT, DASHBOARD_WIDTH, MAP_SIZE, DASHBOARD_Y, MAP_Y, MAP_X_MARGIN, TESLA_DASHCAM_FPS
+from color_grading import create_color_grader, ColorGrader
 from video_io import VideoCaptures, VideoWriterContext
 from rich_console import (
     console,
@@ -169,6 +170,14 @@ class VideoConfig(BaseModel):
     show_timestamp: bool = Field(default=False)
     layout: str = Field(default="grid")
     workers: Optional[int] = Field(default=None, ge=1)
+    # Color grading options
+    color_grade: Optional[str] = Field(default=None)
+    brightness: float = Field(default=0.0, ge=-1.0, le=1.0)
+    contrast: float = Field(default=0.0, ge=-1.0, le=1.0)
+    saturation: float = Field(default=0.0, ge=-1.0, le=1.0)
+    gamma: float = Field(default=1.0, ge=0.1, le=3.0)
+    shadows: float = Field(default=0.0, ge=-1.0, le=1.0)
+    highlights: float = Field(default=0.0, ge=-1.0, le=1.0)
 
     class Config:
         arbitrary_types_allowed = True
@@ -279,6 +288,21 @@ def parse_args() -> VideoConfig:
                        help="Number of parallel workers (default: CPU count)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose (debug) logging")
+    # Color grading options
+    parser.add_argument("--color-grade", type=str, default=None, metavar="PRESET|PATH",
+                       help="Color grading preset name (cinematic, warm, cool, vivid, cybertruck, dramatic, vintage, natural) or path to .cube LUT file")
+    parser.add_argument("--brightness", type=float, default=0.0,
+                       help="Brightness adjustment (-1.0 to 1.0, default: 0)")
+    parser.add_argument("--contrast", type=float, default=0.0,
+                       help="Contrast adjustment (-1.0 to 1.0, default: 0)")
+    parser.add_argument("--saturation", type=float, default=0.0,
+                       help="Saturation adjustment (-1.0 to 1.0, default: 0)")
+    parser.add_argument("--gamma", type=float, default=1.0,
+                       help="Gamma correction (0.1 to 3.0, default: 1.0)")
+    parser.add_argument("--shadows", type=float, default=0.0,
+                       help="Shadow adjustment (-1.0 to 1.0, default: 0)")
+    parser.add_argument("--highlights", type=float, default=0.0,
+                       help="Highlight adjustment (-1.0 to 1.0, default: 0)")
 
     args = parser.parse_args()
 
@@ -316,6 +340,8 @@ def parse_args() -> VideoConfig:
             logger.debug(f"Watermark: {watermark_path}")
         if args.timestamp:
             logger.debug("Timestamp burn-in: enabled")
+        if args.color_grade:
+            logger.debug(f"Color grade: {args.color_grade}")
 
         return VideoConfig(
             playlist=playlist,
@@ -327,7 +353,14 @@ def parse_args() -> VideoConfig:
             watermark_path=watermark_path,
             show_timestamp=args.timestamp,
             layout=args.layout,
-            workers=args.workers
+            workers=args.workers,
+            color_grade=args.color_grade,
+            brightness=args.brightness,
+            contrast=args.contrast,
+            saturation=args.saturation,
+            gamma=args.gamma,
+            shadows=args.shadows,
+            highlights=args.highlights
         )
     except Exception as e:
         print_error(str(e))
@@ -347,7 +380,7 @@ def _init_worker(counter):
 def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map_style: str, north_up: bool,
                       history: List[Tuple[float, float]], cameras: Set[str], sei_data: dict,
                       watermark_path: Optional[str] = None, show_timestamp: bool = False,
-                      layout: str = "grid"):
+                      layout: str = "grid", color_grader: Optional[ColorGrader] = None):
     """
     Worker to process a single clip.
 
@@ -364,6 +397,7 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
         watermark_path: Optional path to watermark image for lower-right corner
         show_timestamp: If True, burn in timestamp from clip filename
         layout: Multi-camera layout: "grid" (default) or "pip" (fullscreen with thumbnails)
+        color_grader: Optional ColorGrader instance for color grading
     """
     global _shared_frame_counter
 
@@ -430,6 +464,10 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                     cameras=cameras,
                     layout=layout
                 )
+
+                # Apply color grading to composited frame (before overlays)
+                if color_grader is not None and color_grader.is_active:
+                    canvas = color_grader.grade(canvas)
 
                 # Get interpolated GPS for smooth map (works even without meta)
                 interp_lat, interp_lon, interp_heading = get_interpolated_gps(frame_idx)
@@ -715,6 +753,13 @@ def main():
         map_style=config.map_style,
         north_up=config.north_up,
         layout=config.layout,
+        color_grade=config.color_grade,
+        brightness=config.brightness,
+        contrast=config.contrast,
+        saturation=config.saturation,
+        gamma=config.gamma,
+        shadows=config.shadows,
+        highlights=config.highlights,
     )
 
     # 1. Extract telemetry from all clips (SEI data + GPS points + frame counts)
@@ -743,6 +788,17 @@ def main():
     num_processes = config.workers if config.workers else multiprocessing.cpu_count()
     print_phase(2, 3, f"Rendering frames ([highlight]{num_processes}[/] workers)")
 
+    # Create color grader (shared across all workers)
+    color_grader = create_color_grader(
+        color_grade=config.color_grade,
+        brightness=config.brightness,
+        contrast=config.contrast,
+        saturation=config.saturation,
+        gamma=config.gamma,
+        shadows=config.shadows,
+        highlights=config.highlights
+    )
+
     # Use a temporary directory for intermediate files
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.debug(f"Using temporary directory: {temp_dir}")
@@ -756,7 +812,7 @@ def main():
             args_list.append((
                 clip, temp_file, config.overlay_scale, config.map_style, config.north_up,
                 clip_histories[i], config.cameras, clip_sei_data[i],
-                config.watermark_path, config.show_timestamp, config.layout
+                config.watermark_path, config.show_timestamp, config.layout, color_grader
             ))
 
         # Create shared counter for real-time frame progress

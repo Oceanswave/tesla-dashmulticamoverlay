@@ -176,6 +176,13 @@ def print_config_summary(
     map_style: str = "simple",
     north_up: bool = False,
     layout: str = "grid",
+    color_grade: str = None,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    gamma: float = 1.0,
+    shadows: float = 0.0,
+    highlights: float = 0.0,
 ) -> None:
     """
     Print a styled configuration summary panel.
@@ -188,6 +195,13 @@ def print_config_summary(
         map_style: Map background style
         north_up: Whether using north-up map orientation
         layout: Multi-camera layout mode ("grid" or "pip")
+        color_grade: Color grading preset name or LUT path
+        brightness: Brightness adjustment (-1.0 to 1.0)
+        contrast: Contrast adjustment (-1.0 to 1.0)
+        saturation: Saturation adjustment (-1.0 to 1.0)
+        gamma: Gamma correction (0.1 to 3.0)
+        shadows: Shadow adjustment (-1.0 to 1.0)
+        highlights: Highlight adjustment (-1.0 to 1.0)
     """
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Key", style="dim")
@@ -200,6 +214,33 @@ def print_config_summary(
     table.add_row("Overlay Scale", f"{overlay_scale:.1f}x")
     table.add_row("Map Style", f"{map_style}")
     table.add_row("Map Orientation", "north-up" if north_up else "heading-up")
+
+    # Color grading settings - only show if any are active
+    color_parts = []
+    if color_grade:
+        # Check if it's a LUT file path or a preset name
+        if color_grade.endswith('.cube'):
+            import os
+            color_parts.append(f"LUT: {os.path.basename(color_grade)}")
+        else:
+            color_parts.append(f"preset: [highlight]{color_grade}[/]")
+    if abs(brightness) >= 0.001:
+        color_parts.append(f"brightness: {brightness:+.2f}")
+    if abs(contrast) >= 0.001:
+        color_parts.append(f"contrast: {contrast:+.2f}")
+    if abs(saturation) >= 0.001:
+        color_parts.append(f"saturation: {saturation:+.2f}")
+    if abs(gamma - 1.0) >= 0.001:
+        color_parts.append(f"gamma: {gamma:.2f}")
+    if abs(shadows) >= 0.001:
+        color_parts.append(f"shadows: {shadows:+.2f}")
+    if abs(highlights) >= 0.001:
+        color_parts.append(f"highlights: {highlights:+.2f}")
+
+    if color_parts:
+        table.add_row("Color Grade", ", ".join(color_parts))
+    else:
+        table.add_row("Color Grade", "[dim]none[/]")
 
     panel = Panel(
         table,

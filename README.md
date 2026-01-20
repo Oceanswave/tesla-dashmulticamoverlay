@@ -20,6 +20,10 @@ A Python tool that processes Tesla dashcam footage by extracting embedded SEI (S
 - **Hardware Acceleration**: Auto-detects and uses GPU encoding when available (VideoToolbox on macOS, NVENC on NVIDIA)
 - **Camera Selection**: Choose which cameras to include in the output
 - **Scalable Overlays**: Adjust overlay size with `--overlay-scale`
+- **Color Grading**: Apply professional color looks via presets, LUT files, or manual adjustments
+  - 8 built-in presets including **Cybertruck** (cold steel aesthetic matching the UI)
+  - Support for industry-standard .cube LUT files (13 included)
+  - Fine-tune brightness, contrast, saturation, gamma, shadows, highlights
 
 ## Requirements
 
@@ -69,6 +73,13 @@ python3 main.py /path/to/dashcam/folder/ output.mp4
 | `--workers`, `-j` | Number of parallel rendering workers | CPU count |
 | `--watermark` | Path to watermark image to overlay in lower-right corner | none |
 | `--timestamp` | Burn in date/time from dashcam filename in lower-left corner | off |
+| `--color-grade` | Color preset name or path to .cube LUT file | none |
+| `--brightness` | Brightness adjustment (-1.0 to 1.0) | 0 |
+| `--contrast` | Contrast adjustment (-1.0 to 1.0) | 0 |
+| `--saturation` | Saturation adjustment (-1.0 to 1.0) | 0 |
+| `--gamma` | Gamma correction (0.1 to 3.0) | 1.0 |
+| `--shadows` | Shadow adjustment (-1.0 to 1.0) | 0 |
+| `--highlights` | Highlight adjustment (-1.0 to 1.0) | 0 |
 | `-v, --verbose` | Enable debug logging | off |
 
 ### Camera Selection
@@ -119,6 +130,78 @@ python3 main.py input/ output.mp4 --map-style satellite
 ```
 
 **Note**: Street and satellite modes fetch map tiles from the internet. If tiles are unavailable, the renderer automatically falls back to simple mode.
+
+### Color Grading
+
+Apply professional color grading to your dashcam footage using presets, LUT files, or manual adjustments.
+
+#### Built-in Presets
+
+| Preset | Style |
+|--------|-------|
+| `cinematic` | Lifted shadows, boosted contrast, muted colors |
+| `warm` | Golden hour feel, lifted shadows |
+| `cool` | Blue hour feel, crisp contrast |
+| `vivid` | Punchy colors, high contrast (great for dashcam clarity) |
+| `cybertruck` | **Cold steel aesthetic** matching the Cybertruck UI theme |
+| `dramatic` | High contrast, crushed blacks |
+| `vintage` | Faded look, lifted blacks, reduced contrast |
+| `natural` | Subtle enhancement, minimal processing |
+
+The **cybertruck** preset gives footage a desaturated, industrial look that matches the stainless steel aesthetic of the Cybertruck's design language.
+
+```bash
+# Apply the cybertruck preset
+python3 main.py input/ output.mp4 --color-grade cybertruck
+
+# Apply cinematic look
+python3 main.py input/ output.mp4 --color-grade cinematic
+
+# Vivid colors for maximum clarity
+python3 main.py input/ output.mp4 --color-grade vivid
+```
+
+#### LUT Files
+
+Use industry-standard .cube LUT files for custom looks. 13 LUTs are included in the `LUTs/` directory:
+
+```bash
+# Apply a LUT file
+python3 main.py input/ output.mp4 --color-grade LUTs/NaturalBoost.cube
+
+# Blue hour look
+python3 main.py input/ output.mp4 --color-grade LUTs/BlueHour.cube
+
+# Autumn colors
+python3 main.py input/ output.mp4 --color-grade LUTs/CrispAutumn.cube
+```
+
+#### Manual Adjustments
+
+Fine-tune the image with individual parameters:
+
+```bash
+# Boost brightness and contrast
+python3 main.py input/ output.mp4 --brightness 0.1 --contrast 0.15
+
+# Desaturate and add contrast (film look)
+python3 main.py input/ output.mp4 --saturation -0.2 --contrast 0.1 --shadows 0.05
+
+# Brighten shadows while keeping highlights
+python3 main.py input/ output.mp4 --shadows 0.15 --highlights -0.05
+```
+
+#### Stacking Preset + Manual Adjustments
+
+Presets provide a base, and manual adjustments are added on top:
+
+```bash
+# Start with warm preset, then reduce brightness slightly
+python3 main.py input/ output.mp4 --color-grade warm --brightness -0.05
+
+# Cybertruck look with extra contrast
+python3 main.py input/ output.mp4 --color-grade cybertruck --contrast 0.1
+```
 
 ### Dynamic Map Zoom
 
@@ -353,14 +436,16 @@ tesla-dashmulticamoverlay/
 ├── sei_parser.py        # H.264 SEI metadata extraction
 ├── visualization.py     # Dashboard overlay and frame compositing
 ├── map_renderer.py      # GPS map with heading-up rotation and tiles
+├── color_grading.py     # LUT-based and parametric color correction
 ├── video_io.py          # FFmpeg-based video I/O
 ├── overlays.py          # Overlay application utilities
-├── constants.py         # Layout dimensions and styling
+├── constants.py         # Layout dimensions, colors, and presets
 ├── rich_console.py      # Terminal output formatting
 ├── map_prototype.py     # Standalone map testing tool
 ├── dashcam.proto        # Protobuf schema for Tesla telemetry
 ├── dashcam_pb2.py       # Generated protobuf bindings
 ├── requirements.txt     # Python dependencies
+├── LUTs/                # Color grading LUT files (.cube)
 └── tests/               # Test suite
 ```
 

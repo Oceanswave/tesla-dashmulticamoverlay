@@ -320,3 +320,94 @@ ALL_CAMERAS = frozenset({
     "left_pillar",
     "right_pillar"
 })
+
+
+# =============================================================================
+# Color Grading Presets
+# =============================================================================
+# Each preset defines adjustments for: brightness, contrast, saturation,
+# gamma, shadows, highlights. Values are additive (except gamma is multiplicative).
+# Presets can be stacked with manual CLI adjustments.
+
+COLOR_PRESETS = {
+    # Cinematic: Slight lift in shadows, boosted contrast, muted colors
+    "cinematic": {
+        "brightness": -0.05,
+        "contrast": 0.15,
+        "saturation": -0.1,
+        "gamma": 1.1,
+        "shadows": 0.08,
+        "highlights": -0.05,
+    },
+
+    # Warm: Golden hour feel, boosted warmth (via saturation), lifted shadows
+    "warm": {
+        "brightness": 0.02,
+        "contrast": 0.05,
+        "saturation": 0.1,
+        "gamma": 0.95,
+        "shadows": 0.05,
+        "highlights": 0.0,
+    },
+
+    # Cool: Blue hour feel, slightly desaturated, crisp contrast
+    "cool": {
+        "brightness": 0.0,
+        "contrast": 0.08,
+        "saturation": -0.05,
+        "gamma": 1.05,
+        "shadows": -0.02,
+        "highlights": 0.02,
+    },
+
+    # Vivid: Punchy colors, high contrast, great for dashcam clarity
+    "vivid": {
+        "brightness": 0.05,
+        "contrast": 0.2,
+        "saturation": 0.35,
+        "gamma": 0.98,
+        "shadows": 0.0,
+        "highlights": 0.0,
+    },
+
+    # Cybertruck: Cold steel aesthetic matching the UI theme
+    # Desaturated, slight blue shift feel, industrial contrast
+    "cybertruck": {
+        "brightness": -0.02,
+        "contrast": 0.12,
+        "saturation": -0.15,
+        "gamma": 1.08,
+        "shadows": 0.02,
+        "highlights": -0.03,
+    },
+
+    # Dramatic: High contrast, crushed blacks, for intense footage
+    "dramatic": {
+        "brightness": -0.08,
+        "contrast": 0.25,
+        "saturation": 0.05,
+        "gamma": 1.15,
+        "shadows": -0.1,
+        "highlights": 0.05,
+    },
+
+    # Vintage: Faded look, lifted blacks, reduced contrast
+    "vintage": {
+        "brightness": 0.03,
+        "contrast": -0.05,
+        "saturation": -0.2,
+        "gamma": 0.92,
+        "shadows": 0.15,
+        "highlights": -0.08,
+    },
+
+    # Natural: Subtle enhancement, minimal processing
+    "natural": {
+        "brightness": 0.0,
+        "contrast": 0.05,
+        "saturation": 0.05,
+        "gamma": 1.0,
+        "shadows": 0.02,
+        "highlights": 0.0,
+    },
+}

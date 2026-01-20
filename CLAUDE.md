@@ -32,6 +32,18 @@ python3 main.py input/ output.mp4 --cameras front
 python3 main.py input/ output.mp4 --cameras front,back
 python3 main.py input/ output.mp4 --cameras front,left_repeater,right_repeater
 
+# Color grading with preset
+python3 main.py input/ output.mp4 --color-grade cinematic
+
+# Color grading with LUT file
+python3 main.py input/ output.mp4 --color-grade LUTs/NaturalBoost.cube
+
+# Manual color adjustments
+python3 main.py input/ output.mp4 --brightness 0.1 --contrast 0.15 --saturation 0.2
+
+# Combine preset with manual adjustments (values stack)
+python3 main.py input/ output.mp4 --color-grade warm --brightness -0.05
+
 # Verbose mode (shows debug output for troubleshooting)
 python3 main.py input/ output.mp4 -v
 
@@ -110,6 +122,36 @@ Zoom transitions are smoothed (30% per frame) to prevent jarring changes.
 │   640px    │       640px             │   640px    │
 └────────────┴─────────────────────────┴────────────┘
 ```
+
+### Color Grading (color_grading.py)
+
+Post-composite color correction applied to the entire 1080p frame before overlays.
+
+**Three approaches**:
+1. **LUT-based**: Load standard .cube files (33³ grid) via trilinear interpolation
+2. **Manual adjustments**: CLI flags for brightness, contrast, saturation, gamma, shadows, highlights
+3. **Built-in presets**: Named styles with pre-tuned values
+
+**Presets** (defined in `constants.py:COLOR_PRESETS`):
+| Preset | Description |
+|--------|-------------|
+| `cinematic` | Lifted shadows, boosted contrast, muted colors |
+| `warm` | Golden hour feel, lifted shadows |
+| `cool` | Blue hour feel, crisp contrast |
+| `vivid` | Punchy colors, high contrast for dashcam clarity |
+| `cybertruck` | Cold steel aesthetic matching UI theme (desaturated, industrial) |
+| `dramatic` | High contrast, crushed blacks |
+| `vintage` | Faded look, lifted blacks, reduced contrast |
+| `natural` | Subtle enhancement, minimal processing |
+
+**LUT files available** in `./LUTs/`:
+- BlueArchitecture.cube, BlueHour.cube, ColdChrome.cube, CrispAutumn.cube
+- DarkAndSomber.cube, HardBoost.cube, LongBeachMorning.cube, LushGreen.cube
+- MagicHour.cube, NaturalBoost.cube, OrangeAndBlue.cube, SoftBlackAndWhite.cube, Waves.cube
+
+**Processing order**: LUT → Brightness → Contrast → Saturation → Gamma → Shadows/Highlights
+
+**Performance**: ~3-5ms per 1080p frame (uses numpy vectorized ops and pre-computed gamma LUTs)
 
 ### Data Schema (dashcam.proto)
 
