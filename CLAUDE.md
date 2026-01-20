@@ -75,6 +75,23 @@ Two overlay renderers:
 - `street`: OpenStreetMap tiles via staticmap
 - `satellite`: ESRI World Imagery tiles
 
+**Dynamic Map Zoom**: Map automatically zooms based on vehicle speed with 10 distinct zones:
+
+| Speed (mph) | Zone | crop_scale | View |
+|-------------|------|------------|------|
+| 0-5 | Parking | 3.0 | ~30m (ultra-tight) |
+| 5-10 | Lot | 2.5 | ~45m |
+| 10-15 | Residential | 2.2 | ~60m |
+| 15-20 | City crawl | 1.7 | ~75m |
+| 20-25 | City slow | 1.5 | ~100m |
+| 25-30 | City moderate | 1.3 | ~120m |
+| 30-45 | City | 1.1 | ~150m |
+| 45-60 | Suburban | 0.8 | ~220m |
+| 60-75 | Highway | 0.55 | ~300m |
+| 75+ | Fast | 0.4 | ~400m |
+
+Zoom transitions are smoothed (30% per frame) to prevent jarring changes.
+
 **Adaptive composite layouts** (1920x1080) based on `--cameras` flag:
 - **Front only**: Full screen 1920x1080
 - **Front + back**: Top/bottom split (540px each)
@@ -109,3 +126,6 @@ Protobuf definition for Tesla telemetry with 16 fields including vehicle speed, 
 - **Overlay blending**: 80% overlay opacity over 20% canvas using numpy weighted addition
 - **Temporary directory pattern**: Intermediate H.264 MP4s auto-cleaned after processing
 - **Tile caching for maps**: Street/satellite tiles cached by rounded coordinates to minimize network requests
+- **Crop-then-rotate optimization**: Map rotation crops a smaller region first (using `ROTATION_MARGIN=1.5`), then rotates ~0.8M pixels instead of full composite (~20× faster)
+- **Fixed composite radius**: Tile composite uses fixed radius=8 (17×17 grid) to avoid rebuilds on speed changes; zoom handled by crop_scale instead
+- **Path drawing early-exit**: Reverse iteration with early exit when 20+ consecutive segments are off-screen; path fills visible map area at current zoom

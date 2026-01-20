@@ -23,6 +23,7 @@ from constants import (
     MAP_SIZE, MAP_ZOOM_WINDOW, MAP_PADDING, MAP_ARROW_LENGTH, MAP_SUPERSAMPLE,
     SPEED_ZONE_ECO, SPEED_ZONE_CITY, SPEED_ZONE_SUBURBAN,
     SPEED_ZONE_HIGHWAY, SPEED_ZONE_FAST, SPEED_ZONE_VERY_FAST,
+    ROTATION_MARGIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ class MapRenderer:
 
         # Dynamic zoom smoothing (for speed-based zoom transitions)
         self._current_zoom: Optional[float] = None
+        self._current_crop_scale: Optional[float] = None
 
         # Tile grid cache for street/satellite modes
         # Tiles are cached by their grid coordinates (z, x, y), not arbitrary positions
@@ -115,11 +117,12 @@ class MapRenderer:
         # Composite tile settings
         # We stitch together a grid of tiles into one big composite
         self._tile_size = 256  # Standard web map tile size
-        # Fetch 11x11 grid (5 tiles in each direction) for:
+        # FIXED radius for performance: avoid rebuilding composite on speed changes.
+        # Radius 8 = 17x17 grid = 4352px composite, provides ample coverage for:
         # - Rotation headroom (45° rotation needs √2 more coverage)
         # - Prefetch margin so tiles are ready before we scroll to edge
-        self._composite_radius = 5  # 11x11 grid = 2816px composite
-        self._base_composite_radius = 5  # Store original for dynamic adjustment
+        # - All zoom levels (zoom is now handled by crop_scale, not tile count)
+        self._composite_radius = 8  # Fixed 17x17 grid - never changes
         self._composite: Optional[Image.Image] = None  # Stitched composite image
         self._composite_origin_x: int = 0  # Tile X coordinate of top-left of composite
         self._composite_origin_y: int = 0  # Tile Y coordinate of top-left of composite
@@ -184,45 +187,48 @@ class MapRenderer:
                        <1 = zoomed out (more area visible)
         """
         from constants import (
-            MAP_ZOOM_CREEPING, MAP_ZOOM_CITY_SLOW, MAP_ZOOM_CITY,
-            MAP_ZOOM_SUBURBAN, MAP_ZOOM_HIGHWAY, MAP_ZOOM_FAST
+            MAP_ZOOM_PARKING, MAP_ZOOM_LOT, MAP_ZOOM_RESIDENTIAL,
+            MAP_ZOOM_CITY_CRAWL, MAP_ZOOM_CITY_SLOW, MAP_ZOOM_CITY_MODERATE,
+            MAP_ZOOM_CITY, MAP_ZOOM_SUBURBAN, MAP_ZOOM_HIGHWAY, MAP_ZOOM_FAST
         )
 
         speed_mph = speed_mps * 2.237
 
-        # Determine target zoom, tile radius, and crop scale based on speed
-        # Crop scale range: 2.0 at slow speeds (very zoomed in) to 0.4 at high speeds (zoomed out)
-        # This creates a 5× visible difference between parking and highway speeds
-        if speed_mph < 15:
-            target_zoom = MAP_ZOOM_CREEPING
-            tile_radius = self._base_composite_radius
-            target_crop_scale = 2.0  # Very tight zoom for parking/detail
-        elif speed_mph < 30:
+        # Determine target zoom and crop scale based on speed
+        # Expanded low-speed zones for fine-grained control during parking/city driving
+        # Crop scale range: 3.0 (ultra-tight parking) to 0.4 (fast highway)
+        # NOTE: Composite radius is now FIXED (8) for performance - zoom is handled
+        # entirely by crop_scale, avoiding expensive composite rebuilds on speed changes
+        if speed_mph < 5:
+            target_zoom = MAP_ZOOM_PARKING
+            target_crop_scale = 3.0  # Ultra-tight for parking maneuvers
+        elif speed_mph < 10:
+            target_zoom = MAP_ZOOM_LOT
+            target_crop_scale = 2.5  # Parking lot navigation
+        elif speed_mph < 15:
+            target_zoom = MAP_ZOOM_RESIDENTIAL
+            target_crop_scale = 2.2  # Residential streets
+        elif speed_mph < 20:
+            target_zoom = MAP_ZOOM_CITY_CRAWL
+            target_crop_scale = 1.7  # Heavy traffic crawl
+        elif speed_mph < 25:
             target_zoom = MAP_ZOOM_CITY_SLOW
-            tile_radius = self._base_composite_radius
-            target_crop_scale = 1.5  # City driving - still fairly tight
+            target_crop_scale = 1.5  # City driving
+        elif speed_mph < 30:
+            target_zoom = MAP_ZOOM_CITY_MODERATE
+            target_crop_scale = 1.3  # Moderate city speed
         elif speed_mph < 45:
             target_zoom = MAP_ZOOM_CITY
-            tile_radius = self._base_composite_radius
             target_crop_scale = 1.1  # Normal city (baseline)
         elif speed_mph < 60:
             target_zoom = MAP_ZOOM_SUBURBAN
-            tile_radius = self._base_composite_radius + 1
             target_crop_scale = 0.8  # Suburban - wider view
         elif speed_mph < 75:
             target_zoom = MAP_ZOOM_HIGHWAY
-            tile_radius = self._base_composite_radius + 2
             target_crop_scale = 0.55  # Highway - much wider
         else:
             target_zoom = MAP_ZOOM_FAST
-            tile_radius = self._base_composite_radius + 3
             target_crop_scale = 0.4  # Fast highway - very wide view
-
-        # Update composite radius for broader zoom levels (more tiles needed)
-        if self._composite_radius != tile_radius:
-            self._composite_radius = tile_radius
-            # Force composite rebuild on next tile fetch
-            self._composite = None
 
         # Smooth zoom transitions (prevent jarring changes)
         # Use 30% per frame for MUCH faster, more noticeable transitions
@@ -233,11 +239,7 @@ class MapRenderer:
             self._current_crop_scale = target_crop_scale
         else:
             self._current_zoom += (target_zoom - self._current_zoom) * smooth_factor
-            # Initialize crop scale if not set
-            if not hasattr(self, '_current_crop_scale') or self._current_crop_scale is None:
-                self._current_crop_scale = target_crop_scale
-            else:
-                self._current_crop_scale += (target_crop_scale - self._current_crop_scale) * smooth_factor
+            self._current_crop_scale += (target_crop_scale - self._current_crop_scale) * smooth_factor
 
         return self._current_zoom, self._current_crop_scale
 
@@ -488,30 +490,69 @@ class MapRenderer:
 
                 # Composite is north-up, we need to rotate for heading-up
                 if self.heading_up:
-                    rotated = composite.rotate(smooth_heading, resample=Image.Resampling.BILINEAR,
-                                               expand=False)
-                    # Apply rotation to the integer offset vector for cropping
-                    # Rotation is around composite center, so offset from center rotates
-                    rad = math.radians(-smooth_heading)
-                    cos_r, sin_r = math.cos(rad), math.sin(rad)
+                    # OPTIMIZATION: Crop-then-rotate strategy
+                    # Instead of rotating the entire composite (4352px = 18.9M pixels),
+                    # we crop a region first, then rotate the much smaller crop.
+                    # This is ~20x faster for rotation.
 
-                    # Offset from composite center (not origin)
-                    cx_offset = int_offset_x - composite.width // 2
-                    cy_offset = int_offset_y - composite.height // 2
-                    rotated_cx = cx_offset * cos_r - cy_offset * sin_r
-                    rotated_cy = cx_offset * sin_r + cy_offset * cos_r
+                    # Calculate crop size with rotation margin to prevent corner clipping
+                    # ROTATION_MARGIN = 1.5 gives us headroom for 45° rotation (needs √2 ≈ 1.414)
+                    margin_crop_half = int(crop_half * ROTATION_MARGIN)
 
-                    # Crop centered on rotated position with speed-based crop size
-                    crop_cx = rotated.width // 2 + int(rotated_cx)
-                    crop_cy = rotated.height // 2 + int(rotated_cy)
-                    cropped = rotated.crop((crop_cx - crop_half, crop_cy - crop_half,
-                                            crop_cx + crop_half, crop_cy + crop_half))
+                    # Crop from UNROTATED composite centered on our current position
+                    crop_left = int_offset_x - margin_crop_half
+                    crop_top = int_offset_y - margin_crop_half
+                    crop_right = int_offset_x + margin_crop_half
+                    crop_bottom = int_offset_y + margin_crop_half
+
+                    # Ensure crop stays within composite bounds
+                    crop_left = max(0, crop_left)
+                    crop_top = max(0, crop_top)
+                    crop_right = min(composite.width, crop_right)
+                    crop_bottom = min(composite.height, crop_bottom)
+
+                    # Extract the smaller region to rotate
+                    pre_rotated = composite.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+                    # Rotate the SMALLER cropped region (much faster!)
+                    rotated = pre_rotated.rotate(smooth_heading, resample=Image.Resampling.BILINEAR,
+                                                 expand=False)
+
+                    # Final crop from center of rotated image
+                    # The rotation center is at the center of pre_rotated, which is where
+                    # our position was before rotation
+                    rot_center_x = rotated.width // 2
+                    rot_center_y = rotated.height // 2
+
+                    # Crop the final region from center
+                    final_left = rot_center_x - crop_half
+                    final_top = rot_center_y - crop_half
+                    final_right = rot_center_x + crop_half
+                    final_bottom = rot_center_y + crop_half
+
+                    # Handle edge case where margin crop was constrained by composite bounds
+                    final_left = max(0, final_left)
+                    final_top = max(0, final_top)
+                    final_right = min(rotated.width, final_right)
+                    final_bottom = min(rotated.height, final_bottom)
+
+                    # Validate crop dimensions (prevent zero/negative size)
+                    if final_right <= final_left or final_bottom <= final_top:
+                        # Fallback: use available center region
+                        final_left = max(0, rot_center_x - rotated.width // 4)
+                        final_top = max(0, rot_center_y - rotated.height // 4)
+                        final_right = min(rotated.width, rot_center_x + rotated.width // 4)
+                        final_bottom = min(rotated.height, rot_center_y + rotated.height // 4)
+
+                    cropped = rotated.crop((final_left, final_top, final_right, final_bottom))
 
                     # Scale back to internal_size (this creates the zoom effect)
                     img = cropped.resize((internal_size, internal_size), Image.Resampling.BILINEAR)
 
                     # Rotate fractional offset for sub-pixel shift (applied later)
                     # Scale by crop_scale since we resized
+                    rad = math.radians(-smooth_heading)
+                    cos_r, sin_r = math.cos(rad), math.sin(rad)
                     tile_frac_x = (frac_offset_x * cos_r - frac_offset_y * sin_r) * crop_scale
                     tile_frac_y = (frac_offset_x * sin_r + frac_offset_y * cos_r) * crop_scale
                 else:
@@ -760,11 +801,16 @@ class MapRenderer:
             mid_dist = math.sqrt((mid_x - center) ** 2 + (mid_y - center) ** 2)
             return mid_dist < visible_radius
 
-        # Draw path segments
+        # Draw path segments - OPTIMIZED: reverse iterate with early exit
+        # Path extends to fill the visible map area, stops when it scrolls off-screen
         n_segments = len(self.path) - 1
         line_width = max(2, int(3 * self.scale * self._supersample * crop_scale))
 
-        for i in range(n_segments):
+        # Track consecutive off-screen segments for early exit
+        consecutive_offscreen = 0
+
+        # Reverse iterate: draw newest first, exit early when path leaves screen
+        for i in range(n_segments - 1, -1, -1):
             p1 = self.path[i]
             p2 = self.path[i + 1]
 
@@ -772,7 +818,14 @@ class MapRenderer:
             pt2 = to_screen(p2[0], p2[1])
 
             if not is_segment_visible(pt1, pt2):
+                consecutive_offscreen += 1
+                # Early exit: if 20+ consecutive segments are off-screen,
+                # the path has scrolled beyond the visible map edge
+                if consecutive_offscreen >= 20:
+                    break
                 continue
+
+            consecutive_offscreen = 0  # Reset on visible segment
 
             # Fade factor: 0 at oldest, 1 at newest
             fade = 1.0 - (i / n_segments)
@@ -876,12 +929,17 @@ class MapRenderer:
             mid_dist = math.sqrt((mid_x - center) ** 2 + (mid_y - center) ** 2)
             return mid_dist < visible_radius
 
-        # Draw ALL path segments, skipping only those completely off-screen
-        # This preserves path shape integrity (no straightening from filtered points)
+        # Draw path segments - OPTIMIZED: reverse iterate with early exit
+        # Path extends to fill the visible map area at current zoom level
+        # When zoomed out (faster speed), more path becomes visible automatically
         n_segments = len(self.path) - 1
         line_width = max(2, int(3 * self.scale * self._supersample))
 
-        for i in range(n_segments):
+        # Track consecutive off-screen segments for early exit
+        consecutive_offscreen = 0
+
+        # Reverse iterate: draw newest first, exit early when path leaves screen
+        for i in range(n_segments - 1, -1, -1):
             p1 = self.path[i]
             p2 = self.path[i + 1]
 
@@ -891,7 +949,14 @@ class MapRenderer:
 
             # Skip segments that are completely outside visible area
             if not is_segment_visible(pt1, pt2):
+                consecutive_offscreen += 1
+                # Early exit: if 20+ consecutive segments are off-screen,
+                # the path has scrolled beyond the visible map edge
+                if consecutive_offscreen >= 20:
+                    break
                 continue
+
+            consecutive_offscreen = 0  # Reset on visible segment
 
             # Fade factor: 0 at oldest (start), 1 at newest (end)
             fade = 1.0 - (i / n_segments)

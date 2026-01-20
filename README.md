@@ -9,7 +9,7 @@ A Python tool that processes Tesla dashcam footage by extracting embedded SEI (S
   - Speedometer gauge with animated needle
   - Steering wheel indicator showing wheel position
   - Accelerator and brake pedal positions
-  - **G-Ball indicator** showing lateral and longitudinal acceleration
+  - **G-ball indicator** showing lateral and longitudinal acceleration
   - **Blinker/turn signal indicators** (left, right, hazards)
   - Gear indicator (P/R/N/D)
   - Autopilot status
@@ -30,7 +30,7 @@ A Python tool that processes Tesla dashcam footage by extracting embedded SEI (S
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/tesla-dashmulticamoverlay.git
+   git clone https://github.com/oceanswave/tesla-dashmulticamoverlay.git
    cd tesla-dashmulticamoverlay
    ```
 
@@ -120,6 +120,25 @@ python3 main.py input/ output.mp4 --map-style satellite
 
 **Note**: Street and satellite modes fetch map tiles from the internet. If tiles are unavailable, the renderer automatically falls back to simple mode.
 
+### Dynamic Map Zoom
+
+The map automatically adjusts zoom level based on vehicle speed for optimal detail at each driving context:
+
+| Speed | Zoom Level | Best For |
+|-------|------------|----------|
+| 0-5 mph | Ultra-tight (~30m) | Parking maneuvers |
+| 5-10 mph | Tight (~45m) | Parking lot navigation |
+| 10-15 mph | Close (~60m) | Residential streets |
+| 15-20 mph | Near (~75m) | Heavy traffic |
+| 20-25 mph | City slow (~100m) | Normal city driving |
+| 25-30 mph | City (~120m) | Flowing traffic |
+| 30-45 mph | Suburban (~150m) | Busy streets |
+| 45-60 mph | Wide (~220m) | Suburban roads |
+| 60-75 mph | Highway (~300m) | Highway driving |
+| 75+ mph | Very wide (~400m) | Fast highway |
+
+Zoom transitions are smoothed to prevent jarring changes when accelerating or braking.
+
 ### Watermark and Timestamp
 
 Add branding or timestamp information to your videos:
@@ -134,7 +153,7 @@ python3 main.py input/ output.mp4 --timestamp
 python3 main.py input/ output.mp4 --watermark logo.png --timestamp
 ```
 
-The timestamp displays the date/time from the dashcam filename (e.g., `2026-01-09 11:45:38`) plus a running timecode showing elapsed time within each clip.
+The timestamp displays the date/time from the dashcam filename (e.g., `2024-01-15 11:45:38`) plus a running timecode showing elapsed time within each clip.
 
 **Supported watermark formats**: PNG, JPG, GIF, BMP. The watermark is automatically resized to fit within the overlay scale while preserving aspect ratio.
 
@@ -201,53 +220,21 @@ The composite video (1920x1080) adapts based on selected cameras:
 +-----------------------+-----------------------+
 ```
 
-### Layout 5: Front + Left Repeater (`--cameras front,left_repeater`)
+### Layouts 5-8: Front + Single Side Camera
+
+When pairing front with one side camera (`left_repeater`, `right_repeater`, `left_pillar`, or `right_pillar`), the layout places them side-by-side:
 
 ```
 +----------------+--------------------------------+
 |                |                                |
-|  L. Repeater   |                                |
-|    (640px)     |        Front (1280x1080)       |
-|                |                                |
-|                |                                |
+|  Side Camera   |        Front (1280x1080)       |
+|    (640px)     |                                |
 +----------------+--------------------------------+
 ```
 
-### Layout 6: Front + Right Repeater (`--cameras front,right_repeater`)
-
-```
-+--------------------------------+----------------+
-|                                |                |
-|                                |  R. Repeater   |
-|        Front (1280x1080)       |    (640px)     |
-|                                |                |
-|                                |                |
-+--------------------------------+----------------+
-```
-
-### Layout 7: Front + Left Pillar (`--cameras front,left_pillar`)
-
-```
-+----------------+--------------------------------+
-|                |                                |
-|   L. Pillar    |                                |
-|    (640px)     |        Front (1280x1080)       |
-|                |                                |
-|                |                                |
-+----------------+--------------------------------+
-```
-
-### Layout 8: Front + Right Pillar (`--cameras front,right_pillar`)
-
-```
-+--------------------------------+----------------+
-|                                |                |
-|                                |   R. Pillar    |
-|        Front (1280x1080)       |    (640px)     |
-|                                |                |
-|                                |                |
-+--------------------------------+----------------+
-```
+Left cameras appear on the left; right cameras on the right. Examples:
+- `--cameras front,left_repeater`
+- `--cameras front,right_pillar`
 
 ### Layout 9: Full 6-Camera (default, `--layout grid`)
 
@@ -283,19 +270,19 @@ Use this layout when you want the front camera to fill the entire screen with ot
 python3 main.py input/ output.mp4 --layout pip
 ```
 
-Thumbnail dimensions are 280x158 pixels each. The rear camera is horizontally flipped for a normalized driver's-perspective view.
+Thumbnail dimensions are 280x158 pixels each. The rear camera is mirrored so it matches what you'd see in a rearview mirror.
 
 ### Overlay Positions
 
 Overlays are positioned consistently across all layouts:
-- **Dashboard** (speedometer, steering, pedals, G-ball, blinkers, gear): Top center
+- **Dashboard** (speedometer, steering, pedals, g-ball, blinkers, gear): Top center
 - **GPS Map**: Top right corner
 
 ### Dashboard Layout
 
 ```
 +------------------------------------------------------------------+
-|  [<]     Speedometer    Steering    Pedals    G-Ball       [>]   |
+|  [<]     Speedometer    Steering    Pedals    G-ball       [>]   |
 | Blinker     (gauge)     (wheel)     (P/B)   (accel dot)  Blinker |
 |                                                                   |
 |                    GEAR: D  |  MODE: Manual                       |
@@ -306,7 +293,7 @@ Overlays are positioned consistently across all layouts:
 - **Speedometer**: Animated gauge showing current speed in MPH
 - **Steering Wheel**: Rotating wheel showing steering angle
 - **Pedals**: P (accelerator) and B (brake) bar indicators
-- **G-Ball**: Acceleration indicator with dot showing lateral/longitudinal forces
+- **G-ball**: Acceleration indicator with dot showing lateral/longitudinal forces
 - **Status**: Current gear and autopilot mode
 
 ## How It Works
@@ -428,4 +415,7 @@ MIT License - See LICENSE file for details.
 
 ## Acknowledgments
 
-- Tesla for embedding telemetry in dashcam footage
+- Tesla for embedding telemetry data in dashcam footage
+- [OpenStreetMap](https://www.openstreetmap.org/) contributors for street map tiles
+- [ESRI](https://www.esri.com/) for satellite imagery tiles
+- [FFmpeg](https://ffmpeg.org/) for video processing

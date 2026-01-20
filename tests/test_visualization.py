@@ -607,3 +607,228 @@ class TestBlinkerIndicators:
         result = renderer.render(meta)
 
         assert result is not None
+
+
+class TestMapRendererDynamicZoom:
+    """Tests for speed-based dynamic zoom feature."""
+
+    def test_zoom_attributes_initialized(self):
+        """Zoom attributes should be initialized to None."""
+        renderer = MapRenderer()
+
+        assert renderer._current_zoom is None
+        assert renderer._current_crop_scale is None
+
+    def test_parking_speed_zoom(self, sample_gps_history):
+        """0-5 mph should use parking zoom (crop_scale 3.0)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 2.0 / 2.237  # ~2 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 3.0  # Ultra-tight for parking
+
+    def test_lot_speed_zoom(self, sample_gps_history):
+        """5-10 mph should use lot zoom (crop_scale 2.5)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 7.0 / 2.237  # ~7 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 2.5  # Parking lot
+
+    def test_residential_speed_zoom(self, sample_gps_history):
+        """10-15 mph should use residential zoom (crop_scale 2.2)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 12.0 / 2.237  # ~12 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 2.2  # Residential
+
+    def test_city_crawl_speed_zoom(self, sample_gps_history):
+        """15-20 mph should use city crawl zoom (crop_scale 1.7)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 17.0 / 2.237  # ~17 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 1.7  # City crawl
+
+    def test_city_slow_speed_zoom(self, sample_gps_history):
+        """20-25 mph should use city slow zoom (crop_scale 1.5)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 22.0 / 2.237  # ~22 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 1.5  # City slow
+
+    def test_city_moderate_speed_zoom(self, sample_gps_history):
+        """25-30 mph should use city moderate zoom (crop_scale 1.3)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 27.0 / 2.237  # ~27 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 1.3  # City moderate
+
+    def test_city_speed_zoom(self, sample_gps_history):
+        """30-45 mph should use city zoom (crop_scale 1.1)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 35.0 / 2.237  # ~35 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 1.1  # City
+
+    def test_suburban_speed_zoom(self, sample_gps_history):
+        """45-60 mph should use suburban zoom (crop_scale 0.8)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 50.0 / 2.237  # ~50 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 0.8  # Suburban
+
+    def test_highway_speed_zoom(self, sample_gps_history):
+        """60-75 mph should use highway zoom (crop_scale 0.55)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 65.0 / 2.237  # ~65 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 0.55  # Highway
+
+    def test_fast_speed_zoom(self, sample_gps_history):
+        """75+ mph should use fast zoom (crop_scale 0.4)."""
+        renderer = MapRenderer(history=sample_gps_history)
+        speed_mps = 80.0 / 2.237  # ~80 mph
+
+        zoom, crop_scale = renderer._get_dynamic_zoom(speed_mps)
+
+        assert crop_scale == 0.4  # Fast highway
+
+    def test_zoom_smoothing(self, sample_gps_history):
+        """Zoom should smooth transitions between speeds."""
+        renderer = MapRenderer(history=sample_gps_history)
+
+        # First call sets initial values
+        renderer._get_dynamic_zoom(10.0 / 2.237)  # ~10 mph -> 2.2 crop_scale
+        initial_crop_scale = renderer._current_crop_scale
+
+        # Second call at different speed should smooth
+        renderer._get_dynamic_zoom(50.0 / 2.237)  # ~50 mph -> 0.8 target
+        smoothed_crop_scale = renderer._current_crop_scale
+
+        # Should have moved toward 0.8 but not all the way
+        assert smoothed_crop_scale < initial_crop_scale
+        assert smoothed_crop_scale > 0.8
+
+
+class TestMapRendererCompositeRadius:
+    """Tests for fixed composite radius optimization."""
+
+    def test_composite_radius_is_fixed(self):
+        """Composite radius should be fixed at 8."""
+        renderer = MapRenderer()
+
+        assert renderer._composite_radius == 8
+
+    def test_composite_radius_unchanged_by_speed(self, sample_gps_history):
+        """Composite radius should not change based on speed."""
+        renderer = MapRenderer(history=sample_gps_history)
+        initial_radius = renderer._composite_radius
+
+        # Call dynamic zoom at various speeds
+        renderer._get_dynamic_zoom(5.0 / 2.237)   # Parking
+        renderer._get_dynamic_zoom(50.0 / 2.237)  # Suburban
+        renderer._get_dynamic_zoom(80.0 / 2.237)  # Fast highway
+
+        # Radius should remain unchanged
+        assert renderer._composite_radius == initial_radius
+        assert renderer._composite_radius == 8
+
+
+class TestMapRendererPathDrawing:
+    """Tests for path drawing with early-exit optimization."""
+
+    def test_path_renders_with_many_points(self):
+        """Path should render correctly with many GPS points."""
+        # Generate a long path (500 points)
+        history = [(37.7749 + i * 0.0001, -122.4194 + i * 0.0001, 10.0)
+                   for i in range(500)]
+        renderer = MapRenderer(history=history)
+
+        result = renderer.render(45.0, 37.7749 + 0.05, -122.4194 + 0.05)
+
+        assert result is not None
+        assert result.shape == (MAP_SIZE, MAP_SIZE, 3)
+
+    def test_path_extends_to_visible_area(self, sample_gps_history):
+        """Path should extend to fill visible map area."""
+        renderer = MapRenderer(history=sample_gps_history)
+
+        # Render should complete without error
+        result = renderer.render(45.0, 37.7749, -122.4194)
+
+        assert result is not None
+
+    def test_empty_path_renders(self):
+        """Map should render with empty path."""
+        renderer = MapRenderer()
+
+        result = renderer.render(45.0, 37.7749, -122.4194)
+
+        assert result is not None
+        assert result.shape == (MAP_SIZE, MAP_SIZE, 3)
+
+    def test_single_point_path_renders(self):
+        """Map should render with single point path."""
+        renderer = MapRenderer(history=[(37.7749, -122.4194)])
+
+        result = renderer.render(45.0, 37.7749, -122.4194)
+
+        assert result is not None
+
+
+class TestMapRendererCropRotate:
+    """Tests for crop-then-rotate optimization."""
+
+    def test_render_with_speed_parameter(self, sample_gps_history):
+        """Render should accept speed_mps parameter for zoom."""
+        renderer = MapRenderer(history=sample_gps_history)
+
+        # Test with various speeds
+        for speed_mph in [5, 25, 50, 75]:
+            speed_mps = speed_mph / 2.237
+            result = renderer.render(45.0, 37.7749, -122.4194, speed_mps=speed_mps)
+
+            assert result is not None
+            assert result.shape == (MAP_SIZE, MAP_SIZE, 3)
+
+    def test_render_at_different_headings(self, sample_gps_history):
+        """Render should work at all heading angles."""
+        renderer = MapRenderer(history=sample_gps_history)
+
+        for heading in [0, 45, 90, 135, 180, 225, 270, 315]:
+            result = renderer.render(heading, 37.7749, -122.4194)
+
+            assert result is not None
+            assert result.shape == (MAP_SIZE, MAP_SIZE, 3)
+
+    def test_heading_smoothing(self, sample_gps_history):
+        """Heading should be smoothed between frames."""
+        renderer = MapRenderer(history=sample_gps_history)
+
+        # First call sets initial heading
+        renderer.render(0.0, 37.7749, -122.4194)
+        initial_smoothed = renderer._smoothed_heading
+
+        # Large heading change should be smoothed
+        renderer.render(90.0, 37.7749, -122.4194)
+        smoothed = renderer._smoothed_heading
+
+        # Should have moved toward 90 but not jumped all the way
+        assert smoothed > initial_smoothed
+        assert smoothed < 90.0

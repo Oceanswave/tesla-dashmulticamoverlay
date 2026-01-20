@@ -153,12 +153,21 @@ MAP_SIZE = 300
 MAP_ZOOM_WINDOW = 0.002  # Degrees (~200m view) - default/fallback
 
 # Dynamic map zoom based on speed (degrees, smaller = tighter zoom)
-MAP_ZOOM_CREEPING = 0.0008    # < 15 mph: ~60m view (parking, traffic)
-MAP_ZOOM_CITY_SLOW = 0.0012   # 15-30 mph: ~100m view (city driving)
+# Low-speed zones (expanded for parking/city detail)
+MAP_ZOOM_PARKING = 0.0004     # 0-5 mph: ~30m view (parking maneuvers)
+MAP_ZOOM_LOT = 0.0006         # 5-10 mph: ~45m view (parking lot)
+MAP_ZOOM_RESIDENTIAL = 0.0008 # 10-15 mph: ~60m view (residential streets)
+MAP_ZOOM_CITY_CRAWL = 0.0010  # 15-20 mph: ~75m view (heavy traffic)
+MAP_ZOOM_CITY_SLOW = 0.0012   # 20-25 mph: ~100m view (city driving)
+MAP_ZOOM_CITY_MODERATE = 0.0015  # 25-30 mph: ~120m view (moderate city)
+# Higher-speed zones
 MAP_ZOOM_CITY = 0.0018        # 30-45 mph: ~150m view (busy streets)
 MAP_ZOOM_SUBURBAN = 0.0025    # 45-60 mph: ~220m view (suburban roads)
 MAP_ZOOM_HIGHWAY = 0.0035     # 60-75 mph: ~300m view (highway)
 MAP_ZOOM_FAST = 0.0045        # 75+ mph: ~400m view (fast highway)
+
+# Legacy alias for backward compatibility
+MAP_ZOOM_CREEPING = MAP_ZOOM_RESIDENTIAL
 
 MAP_PADDING = 0.1
 MAP_SUPERSAMPLE = 2  # Render at 2x resolution for sub-pixel smooth scrolling
@@ -167,6 +176,11 @@ MAP_ARROW_LENGTH = 15
 # Map tile settings (for street/satellite modes)
 MAP_TILE_ZOOM = 17  # ~150m view at zoom 17
 MAP_TILE_CACHE_SIZE = 50  # Max cached tiles
+
+# Rotation optimization: crop margin multiplier for crop-then-rotate strategy
+# ROTATION_MARGIN = 1.5 means the crop radius is 1.5x larger (area is 2.25x)
+# This ensures no corner clipping at 45° rotation (requires √2 ≈ 1.414x radius)
+ROTATION_MARGIN = 1.5
 
 
 # =============================================================================
