@@ -44,6 +44,9 @@ python3 main.py input/ output.mp4 --brightness 0.1 --contrast 0.15 --saturation 
 # Combine preset with manual adjustments (values stack)
 python3 main.py input/ output.mp4 --color-grade warm --brightness -0.05
 
+# Disable dynamic camera emphasis
+python3 main.py input/ output.mp4 --no-emphasis
+
 # Verbose mode (shows debug output for troubleshooting)
 python3 main.py input/ output.mp4 -v
 
@@ -122,6 +125,29 @@ Zoom transitions are smoothed (30% per frame) to prevent jarring changes.
 │   640px    │       640px             │   640px    │
 └────────────┴─────────────────────────┴────────────┘
 ```
+
+### Dynamic Camera Emphasis (emphasis.py)
+
+Context-aware camera highlighting that emphasizes relevant cameras based on driving conditions:
+
+**EmphasisCalculator class**: Computes per-camera emphasis weights (0.0-1.0) based on SEI metadata triggers.
+
+**Trigger priority** (highest first):
+1. **Turn signals**: Blinker → side cameras with orange border (100% repeater, 70% pillar)
+2. **Reverse gear**: Reverse → back camera with green border
+3. **Heavy braking**: >0.3g deceleration → back camera with red border (proportional)
+4. **Lateral G-force**: >0.2g lateral → side cameras with amber border (proportional)
+
+**Visual effects**:
+- Colored inset borders (4px, drawn inside camera frame to prevent overlap)
+- Up to 15% size increase in some layouts (growth direction prevents collision)
+- 30% smoothing per frame for gradual transitions
+
+**Overlap prevention**:
+- When both left AND right cameras emphasized simultaneously, each capped to 50% max scale
+- Borders always drawn inset (never extend beyond camera bounds)
+
+**CLI**: `--no-emphasis` disables the feature entirely (default: enabled)
 
 ### Color Grading (color_grading.py)
 

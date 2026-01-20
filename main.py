@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from sei_parser import extract_sei_data
 from visualization import DashboardRenderer, MapRenderer, composite_frame, apply_overlay, render_watermark, render_timestamp
+from emphasis import EmphasisCalculator
 from constants import OUTPUT_WIDTH, OUTPUT_HEIGHT, DASHBOARD_WIDTH, MAP_SIZE, DASHBOARD_Y, MAP_Y, MAP_X_MARGIN, TESLA_DASHCAM_FPS
 from color_grading import create_color_grader, ColorGrader
 from video_io import VideoCaptures, VideoWriterContext
@@ -178,6 +179,8 @@ class VideoConfig(BaseModel):
     gamma: float = Field(default=1.0, ge=0.1, le=3.0)
     shadows: float = Field(default=0.0, ge=-1.0, le=1.0)
     highlights: float = Field(default=0.0, ge=-1.0, le=1.0)
+    # Dynamic camera emphasis
+    enable_emphasis: bool = Field(default=True)
 
     class Config:
         arbitrary_types_allowed = True
@@ -303,6 +306,9 @@ def parse_args() -> VideoConfig:
                        help="Shadow adjustment (-1.0 to 1.0, default: 0)")
     parser.add_argument("--highlights", type=float, default=0.0,
                        help="Highlight adjustment (-1.0 to 1.0, default: 0)")
+    # Dynamic camera emphasis
+    parser.add_argument("--no-emphasis", action="store_true",
+                       help="Disable dynamic camera emphasis based on driving context")
 
     args = parser.parse_args()
 
@@ -360,7 +366,8 @@ def parse_args() -> VideoConfig:
             saturation=args.saturation,
             gamma=args.gamma,
             shadows=args.shadows,
-            highlights=args.highlights
+            highlights=args.highlights,
+            enable_emphasis=not args.no_emphasis
         )
     except Exception as e:
         print_error(str(e))
@@ -380,7 +387,8 @@ def _init_worker(counter):
 def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map_style: str, north_up: bool,
                       history: List[Tuple[float, float]], cameras: Set[str], sei_data: dict,
                       watermark_path: Optional[str] = None, show_timestamp: bool = False,
-                      layout: str = "grid", color_grader: Optional[ColorGrader] = None):
+                      layout: str = "grid", color_grader: Optional[ColorGrader] = None,
+                      enable_emphasis: bool = True):
     """
     Worker to process a single clip.
 
@@ -398,6 +406,7 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
         show_timestamp: If True, burn in timestamp from clip filename
         layout: Multi-camera layout: "grid" (default) or "pip" (fullscreen with thumbnails)
         color_grader: Optional ColorGrader instance for color grading
+        enable_emphasis: If True, enable dynamic camera emphasis based on driving context
     """
     global _shared_frame_counter
 
@@ -423,6 +432,9 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                 map_style=map_style,
                 heading_up=not north_up
             )
+
+            # Initialize emphasis calculator for dynamic camera highlighting
+            emphasis_calculator = EmphasisCalculator() if enable_emphasis else None
 
             # Build GPS interpolator for buttery smooth map scrolling
             # This interpolates between GPS keyframes for every video frame
@@ -454,6 +466,9 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
 
                 meta = sei_data.get(frame_idx)
 
+                # Compute camera emphasis based on driving context
+                emphasis = emphasis_calculator.compute(meta) if emphasis_calculator else None
+
                 canvas = composite_frame(
                     front=frames['front'],
                     left_rep=frames.get('left_rep'),
@@ -462,7 +477,8 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                     left_pill=frames.get('left_pill'),
                     right_pill=frames.get('right_pill'),
                     cameras=cameras,
-                    layout=layout
+                    layout=layout,
+                    emphasis=emphasis
                 )
 
                 # Apply color grading to composited frame (before overlays)
@@ -812,7 +828,8 @@ def main():
             args_list.append((
                 clip, temp_file, config.overlay_scale, config.map_style, config.north_up,
                 clip_histories[i], config.cameras, clip_sei_data[i],
-                config.watermark_path, config.show_timestamp, config.layout, color_grader
+                config.watermark_path, config.show_timestamp, config.layout, color_grader,
+                config.enable_emphasis
             ))
 
         # Create shared counter for real-time frame progress

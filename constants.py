@@ -329,6 +329,29 @@ ALL_CAMERAS = frozenset({
 # gamma, shadows, highlights. Values are additive (except gamma is multiplicative).
 # Presets can be stacked with manual CLI adjustments.
 
+# =============================================================================
+# Dynamic Camera Emphasis Settings
+# =============================================================================
+
+# Emphasis thresholds (G-force)
+EMPHASIS_LATERAL_G_THRESHOLD = 0.2    # Minimum lateral G for turn emphasis
+EMPHASIS_BRAKING_G_THRESHOLD = 0.3    # Minimum braking G for rear emphasis
+
+# Smoothing factor for gradual transitions (matches map zoom)
+EMPHASIS_SMOOTHING_FACTOR = 0.3       # 30% interpolation per frame
+
+# Visual parameters
+EMPHASIS_MAX_SCALE_BOOST = 0.15       # Max 15% size increase
+EMPHASIS_BORDER_WIDTH = 4             # Border thickness in pixels
+EMPHASIS_VISIBILITY_THRESHOLD = 0.05  # Minimum weight to show border
+
+# Emphasis colors (from Cybertruck palette)
+EMPHASIS_COLOR_BLINKER = COLORS.CT_ORANGE   # Turn signal emphasis
+EMPHASIS_COLOR_BRAKE = COLORS.CT_RED        # Braking emphasis
+EMPHASIS_COLOR_REVERSE = COLORS.CT_GREEN    # Reverse gear emphasis
+EMPHASIS_COLOR_LATERAL = COLORS.CT_AMBER    # Lateral G (turn) emphasis
+
+
 COLOR_PRESETS = {
     # Cinematic: Slight lift in shadows, boosted contrast, muted colors
     "cinematic": {

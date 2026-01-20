@@ -80,6 +80,7 @@ python3 main.py /path/to/dashcam/folder/ output.mp4
 | `--gamma` | Gamma correction (0.1 to 3.0) | 1.0 |
 | `--shadows` | Shadow adjustment (-1.0 to 1.0) | 0 |
 | `--highlights` | Highlight adjustment (-1.0 to 1.0) | 0 |
+| `--no-emphasis` | Disable dynamic camera emphasis effects | off |
 | `-v, --verbose` | Enable debug logging | off |
 
 ### Camera Selection
@@ -221,6 +222,32 @@ The map automatically adjusts zoom level based on vehicle speed for optimal deta
 | 75+ mph | Very wide (~400m) | Fast highway |
 
 Zoom transitions are smoothed to prevent jarring changes when accelerating or braking.
+
+### Dynamic Camera Emphasis
+
+Cameras automatically receive visual emphasis based on driving context to draw attention to relevant views during maneuvers:
+
+| Trigger | Condition | Cameras Affected | Border Color |
+|---------|-----------|------------------|--------------|
+| Left turn signal | Blinker active | Left repeater + pillar | Orange |
+| Right turn signal | Blinker active | Right repeater + pillar | Orange |
+| Reverse gear | Gear = R | Rear camera | Green |
+| Heavy braking | Deceleration > 0.3g | Rear camera | Red |
+| Left turn | Lateral G < -0.2g | Left cameras | Amber |
+| Right turn | Lateral G > 0.2g | Right cameras | Amber |
+
+**Visual effects**:
+- Emphasized cameras grow up to **15% larger** (growing inward toward center)
+- Colored **inset borders** indicate the emphasis trigger
+- Smooth transitions (30% interpolation per frame) prevent jarring changes
+- Priority order: blinker > reverse > braking > lateral G-force
+
+When both left and right cameras are emphasized simultaneously (e.g., hazard lights), each is capped at 50% emphasis to prevent collision.
+
+To disable emphasis effects:
+```bash
+python3 main.py input/ output.mp4 --no-emphasis
+```
 
 ### Watermark and Timestamp
 
@@ -435,6 +462,7 @@ tesla-dashmulticamoverlay/
 ├── main.py              # CLI entry point and processing pipeline
 ├── sei_parser.py        # H.264 SEI metadata extraction
 ├── visualization.py     # Dashboard overlay and frame compositing
+├── emphasis.py          # Dynamic camera emphasis based on driving context
 ├── map_renderer.py      # GPS map with heading-up rotation and tiles
 ├── color_grading.py     # LUT-based and parametric color correction
 ├── video_io.py          # FFmpeg-based video I/O

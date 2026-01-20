@@ -43,7 +43,18 @@ from constants import (
     SPEED_ZONE_HIGHWAY, SPEED_ZONE_FAST, SPEED_ZONE_VERY_FAST,
     SPEED_ZONE_LOW, SPEED_ZONE_MID, SPEED_ZONE_HIGH,
     GBALL_ZONE_SAFE, GBALL_ZONE_SPORT,
+    EMPHASIS_MAX_SCALE_BOOST,
+    EMPHASIS_VISIBILITY_THRESHOLD,
 )
+
+# Import emphasis types (optional - graceful fallback if not available)
+try:
+    from emphasis import EmphasisState, CameraEmphasis
+    EMPHASIS_AVAILABLE = True
+except ImportError:
+    EMPHASIS_AVAILABLE = False
+    EmphasisState = None
+    CameraEmphasis = None
 
 # Re-export MapRenderer for backward compatibility
 from map_renderer import MapRenderer
@@ -803,6 +814,124 @@ def _draw_rectangle(canvas: np.ndarray, x1: int, y1: int, x2: int, y2: int,
     canvas[:] = np.array(img)
 
 
+def _draw_emphasis_border(canvas: np.ndarray, x: int, y: int, width: int, height: int,
+                          color: Tuple[int, int, int], thickness: int = 4) -> None:
+    """Draw an inset border inside the camera frame bounds.
+
+    The border is drawn INSIDE the frame, never extending beyond allocated space.
+    This prevents overlap with adjacent cameras regardless of emphasis state.
+
+    Args:
+        canvas: The canvas to draw on (modified in-place)
+        x: Left edge of camera frame
+        y: Top edge of camera frame
+        width: Width of camera frame
+        height: Height of camera frame
+        color: RGB border color
+        thickness: Border thickness in pixels (drawn inward)
+    """
+    # Clamp to canvas bounds
+    ch, cw = canvas.shape[:2]
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(cw, x + width)
+    y2 = min(ch, y + height)
+
+    # Ensure thickness doesn't exceed half the frame dimension
+    t = min(thickness, (x2 - x1) // 4, (y2 - y1) // 4)
+    if t < 1:
+        return
+
+    # Draw four border rectangles (inset)
+    color_arr = np.array(color, dtype=np.uint8)
+
+    # Top border
+    canvas[y1:y1+t, x1:x2] = color_arr
+    # Bottom border
+    canvas[y2-t:y2, x1:x2] = color_arr
+    # Left border
+    canvas[y1:y2, x1:x1+t] = color_arr
+    # Right border
+    canvas[y1:y2, x2-t:x2] = color_arr
+
+
+def _apply_emphasis_scale(frame: np.ndarray, base_size: Tuple[int, int],
+                          weight: float, grow_direction: str = "center"
+                          ) -> Tuple[np.ndarray, int, int]:
+    """Scale a frame based on emphasis weight with directional growth.
+
+    Args:
+        frame: Input frame to scale
+        base_size: Target (width, height) without emphasis
+        weight: Emphasis weight 0.0-1.0
+        grow_direction: How the frame grows:
+            - "center": Grows toward center (both directions equally)
+            - "right": Grows rightward (for left-side cameras)
+            - "left": Grows leftward (for right-side cameras)
+            - "up": Grows upward (for bottom cameras)
+
+    Returns:
+        Tuple of (scaled_frame, x_offset, y_offset)
+        Offsets indicate how much to adjust placement position
+    """
+    base_w, base_h = base_size
+    scale_boost = weight * EMPHASIS_MAX_SCALE_BOOST
+
+    new_w = int(base_w * (1 + scale_boost))
+    new_h = int(base_h * (1 + scale_boost))
+
+    # Calculate growth amount
+    grow_w = new_w - base_w
+    grow_h = new_h - base_h
+
+    # Resize frame to new dimensions
+    resized = _resize_frame(frame, (new_w, new_h))
+
+    # Calculate offsets based on growth direction
+    if grow_direction == "center":
+        x_offset = -grow_w // 2
+        y_offset = -grow_h // 2
+    elif grow_direction == "right":
+        # Left cameras grow right - no x offset needed (anchored left)
+        x_offset = 0
+        y_offset = -grow_h // 2
+    elif grow_direction == "left":
+        # Right cameras grow left - offset left by full growth
+        x_offset = -grow_w
+        y_offset = -grow_h // 2
+    elif grow_direction == "up":
+        # Bottom cameras grow up - offset up by full growth
+        x_offset = -grow_w // 2
+        y_offset = -grow_h
+    else:
+        x_offset = 0
+        y_offset = 0
+
+    return resized, x_offset, y_offset
+
+
+def _clamp_mutual_emphasis(left_weight: float, right_weight: float,
+                           max_single: float = 1.0, max_mutual: float = 0.5
+                           ) -> Tuple[float, float]:
+    """Clamp emphasis weights when both left and right cameras are emphasized.
+
+    Prevents center collision by reducing both weights when simultaneous.
+
+    Args:
+        left_weight: Raw left camera emphasis (0.0-1.0)
+        right_weight: Raw right camera emphasis (0.0-1.0)
+        max_single: Max weight when only one side emphasized
+        max_mutual: Max weight per side when both emphasized
+
+    Returns:
+        Tuple of (clamped_left, clamped_right)
+    """
+    if left_weight > 0.01 and right_weight > 0.01:
+        # Both sides emphasized - cap each to max_mutual
+        return min(left_weight, max_mutual), min(right_weight, max_mutual)
+    return min(left_weight, max_single), min(right_weight, max_single)
+
+
 def composite_frame(front: np.ndarray,
                     left_rep: Optional[np.ndarray] = None,
                     right_rep: Optional[np.ndarray] = None,
@@ -810,7 +939,8 @@ def composite_frame(front: np.ndarray,
                     left_pill: Optional[np.ndarray] = None,
                     right_pill: Optional[np.ndarray] = None,
                     cameras: Optional[Set[str]] = None,
-                    layout: str = "grid") -> np.ndarray:
+                    layout: str = "grid",
+                    emphasis: Optional['EmphasisState'] = None) -> np.ndarray:
     """
     Composite multiple camera frames into a single output frame.
 
@@ -822,7 +952,15 @@ def composite_frame(front: np.ndarray,
     - Multi-camera: Original 6-camera grid layout (default)
 
     Args:
+        front: Front camera frame (required)
+        left_rep: Left repeater camera frame
+        right_rep: Right repeater camera frame
+        back: Rear camera frame
+        left_pill: Left pillar camera frame
+        right_pill: Right pillar camera frame
+        cameras: Set of camera names to include
         layout: "grid" (default 6-camera grid) or "pip" (fullscreen with thumbnails)
+        emphasis: Optional EmphasisState for dynamic camera emphasis
     """
     canvas = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
 
@@ -846,29 +984,80 @@ def composite_frame(front: np.ndarray,
             canvas[0:SPLIT_HEIGHT, :] = resized
         if back is not None:
             flipped = _flip_horizontal(back)
-            resized = _resize_frame(flipped, (OUTPUT_WIDTH, SPLIT_HEIGHT))
-            canvas[SPLIT_HEIGHT:OUTPUT_HEIGHT, :] = resized
+            back_emph = emphasis.back if emphasis else None
+            if back_emph and back_emph.weight > 0.01:
+                # Back camera grows upward when emphasized
+                resized, x_off, y_off = _apply_emphasis_scale(
+                    flipped, (OUTPUT_WIDTH, SPLIT_HEIGHT), back_emph.weight, "up")
+                # Clamp placement to canvas
+                bx = max(0, x_off)
+                by = max(SPLIT_HEIGHT, SPLIT_HEIGHT + y_off)
+                bw = min(resized.shape[1], OUTPUT_WIDTH - bx)
+                bh = min(resized.shape[0], OUTPUT_HEIGHT - by)
+                canvas[by:by+bh, bx:bx+bw] = resized[:bh, :bw]
+                if back_emph.border_color:
+                    _draw_emphasis_border(canvas, 0, SPLIT_HEIGHT, OUTPUT_WIDTH,
+                                         SPLIT_HEIGHT, back_emph.border_color, back_emph.border_width)
+            else:
+                resized = _resize_frame(flipped, (OUTPUT_WIDTH, SPLIT_HEIGHT))
+                canvas[SPLIT_HEIGHT:OUTPUT_HEIGHT, :] = resized
             _draw_text(canvas, "Back", (20, SPLIT_HEIGHT + 10), COLORS.WHITE, 16)
         return canvas
 
     # --- LAYOUT 3: Front + side repeaters ---
     if active_cams == {"left_repeater", "right_repeater"}:
+        # Get emphasis weights with mutual clamping
+        left_emph = emphasis.left_repeater if emphasis else None
+        right_emph = emphasis.right_repeater if emphasis else None
+        left_w = left_emph.weight if left_emph else 0.0
+        right_w = right_emph.weight if right_emph else 0.0
+        left_w, right_w = _clamp_mutual_emphasis(left_w, right_w)
+
         if front is not None:
             resized = _resize_frame(front, (REPEATER_LAYOUT_CENTER_WIDTH, OUTPUT_HEIGHT))
             canvas[:, REPEATER_LAYOUT_SIDE_WIDTH:REPEATER_LAYOUT_SIDE_WIDTH + REPEATER_LAYOUT_CENTER_WIDTH] = resized
         if left_rep is not None:
-            resized = _resize_frame(left_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
-            canvas[:, 0:REPEATER_LAYOUT_SIDE_WIDTH] = resized
+            if left_w > 0.01:
+                resized, x_off, y_off = _apply_emphasis_scale(
+                    left_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT), left_w, "right")
+                h, w = resized.shape[:2]
+                # Left camera anchored at left edge, grows right
+                canvas[max(0, y_off):max(0, y_off)+min(h, OUTPUT_HEIGHT), 0:min(w, REPEATER_LAYOUT_SIDE_WIDTH + int(REPEATER_LAYOUT_SIDE_WIDTH * EMPHASIS_MAX_SCALE_BOOST * left_w))] = resized[:min(h, OUTPUT_HEIGHT), :min(w, OUTPUT_WIDTH)]
+                if left_emph and left_emph.border_color:
+                    _draw_emphasis_border(canvas, 0, 0, REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         left_emph.border_color, left_emph.border_width)
+            else:
+                resized = _resize_frame(left_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
+                canvas[:, 0:REPEATER_LAYOUT_SIDE_WIDTH] = resized
             _draw_text(canvas, "L. Repeater", (10, 10), COLORS.WHITE, 12)
         if right_rep is not None:
-            resized = _resize_frame(right_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
-            canvas[:, REPEATER_LAYOUT_SIDE_WIDTH + REPEATER_LAYOUT_CENTER_WIDTH:] = resized
-            _draw_text(canvas, "R. Repeater", (REPEATER_LAYOUT_SIDE_WIDTH + REPEATER_LAYOUT_CENTER_WIDTH + 10, 10),
-                      COLORS.WHITE, 12)
+            rx = REPEATER_LAYOUT_SIDE_WIDTH + REPEATER_LAYOUT_CENTER_WIDTH
+            if right_w > 0.01:
+                resized, x_off, y_off = _apply_emphasis_scale(
+                    right_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT), right_w, "left")
+                h, w = resized.shape[:2]
+                # Right camera anchored at right edge, grows left
+                start_x = max(0, rx + x_off)
+                canvas[max(0, y_off):max(0, y_off)+min(h, OUTPUT_HEIGHT), start_x:OUTPUT_WIDTH] = resized[:min(h, OUTPUT_HEIGHT), :OUTPUT_WIDTH-start_x]
+                if right_emph and right_emph.border_color:
+                    _draw_emphasis_border(canvas, rx, 0, REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         right_emph.border_color, right_emph.border_width)
+            else:
+                resized = _resize_frame(right_rep, (REPEATER_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
+                canvas[:, rx:] = resized
+            _draw_text(canvas, "R. Repeater", (rx + 10, 10), COLORS.WHITE, 12)
         return canvas
 
     # --- LAYOUT 4: Front + back + repeaters (2x2 grid) ---
     if active_cams == {"back", "left_repeater", "right_repeater"}:
+        # Get emphasis with mutual clamping for side cameras
+        left_emph = emphasis.left_repeater if emphasis else None
+        right_emph = emphasis.right_repeater if emphasis else None
+        back_emph = emphasis.back if emphasis else None
+        left_w = left_emph.weight if left_emph else 0.0
+        right_w = right_emph.weight if right_emph else 0.0
+        left_w, right_w = _clamp_mutual_emphasis(left_w, right_w)
+
         if front is not None:
             resized = _resize_frame(front, (GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT))
             canvas[0:GRID_2X2_HALF_HEIGHT, 0:GRID_2X2_HALF_WIDTH] = resized
@@ -877,15 +1066,27 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(flipped, (GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT))
             canvas[0:GRID_2X2_HALF_HEIGHT, GRID_2X2_HALF_WIDTH:] = resized
             _draw_text(canvas, "Back", (GRID_2X2_HALF_WIDTH + 20, 10), COLORS.WHITE, 16)
+            if back_emph and back_emph.border_color and back_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, GRID_2X2_HALF_WIDTH, 0,
+                                     GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT,
+                                     back_emph.border_color, back_emph.border_width)
         if left_rep is not None:
             resized = _resize_frame(left_rep, (GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT))
             canvas[GRID_2X2_HALF_HEIGHT:, 0:GRID_2X2_HALF_WIDTH] = resized
             _draw_text(canvas, "L. Repeater", (20, GRID_2X2_HALF_HEIGHT + 10), COLORS.WHITE, 16)
+            if left_emph and left_emph.border_color and left_w > 0.05:
+                _draw_emphasis_border(canvas, 0, GRID_2X2_HALF_HEIGHT,
+                                     GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT,
+                                     left_emph.border_color, left_emph.border_width)
         if right_rep is not None:
             resized = _resize_frame(right_rep, (GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT))
             canvas[GRID_2X2_HALF_HEIGHT:, GRID_2X2_HALF_WIDTH:] = resized
             _draw_text(canvas, "R. Repeater", (GRID_2X2_HALF_WIDTH + 20, GRID_2X2_HALF_HEIGHT + 10),
                       COLORS.WHITE, 16)
+            if right_emph and right_emph.border_color and right_w > 0.05:
+                _draw_emphasis_border(canvas, GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT,
+                                     GRID_2X2_HALF_WIDTH, GRID_2X2_HALF_HEIGHT,
+                                     right_emph.border_color, right_emph.border_width)
         return canvas
 
     # --- LAYOUT 5: Front + left repeater (side by side) ---
@@ -894,6 +1095,12 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(left_rep, (SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
             canvas[:, 0:SIDE_LAYOUT_SIDE_WIDTH] = resized
             _draw_text(canvas, "L. Repeater", (20, 10), COLORS.WHITE, 16)
+            # Emphasis border for left repeater
+            if emphasis:
+                left_rep_emph = emphasis.get('left_repeater')
+                if left_rep_emph and left_rep_emph.border_color and left_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                    _draw_emphasis_border(canvas, 0, 0, SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         left_rep_emph.border_color, left_rep_emph.border_width)
         if front is not None:
             resized = _resize_frame(front, (SIDE_LAYOUT_FRONT_WIDTH, OUTPUT_HEIGHT))
             canvas[:, SIDE_LAYOUT_SIDE_WIDTH:] = resized
@@ -908,6 +1115,12 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(right_rep, (SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
             canvas[:, SIDE_LAYOUT_FRONT_WIDTH:] = resized
             _draw_text(canvas, "R. Repeater", (SIDE_LAYOUT_FRONT_WIDTH + 20, 10), COLORS.WHITE, 16)
+            # Emphasis border for right repeater
+            if emphasis:
+                right_rep_emph = emphasis.get('right_repeater')
+                if right_rep_emph and right_rep_emph.border_color and right_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                    _draw_emphasis_border(canvas, SIDE_LAYOUT_FRONT_WIDTH, 0, SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         right_rep_emph.border_color, right_rep_emph.border_width)
         return canvas
 
     # --- LAYOUT 7: Front + left pillar (side by side) ---
@@ -916,6 +1129,12 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(left_pill, (SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
             canvas[:, 0:SIDE_LAYOUT_SIDE_WIDTH] = resized
             _draw_text(canvas, "L. Pillar", (20, 10), COLORS.WHITE, 16)
+            # Emphasis border for left pillar
+            if emphasis:
+                left_pill_emph = emphasis.get('left_pillar')
+                if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                    _draw_emphasis_border(canvas, 0, 0, SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         left_pill_emph.border_color, left_pill_emph.border_width)
         if front is not None:
             resized = _resize_frame(front, (SIDE_LAYOUT_FRONT_WIDTH, OUTPUT_HEIGHT))
             canvas[:, SIDE_LAYOUT_SIDE_WIDTH:] = resized
@@ -930,12 +1149,19 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(right_pill, (SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT))
             canvas[:, SIDE_LAYOUT_FRONT_WIDTH:] = resized
             _draw_text(canvas, "R. Pillar", (SIDE_LAYOUT_FRONT_WIDTH + 20, 10), COLORS.WHITE, 16)
+            # Emphasis border for right pillar
+            if emphasis:
+                right_pill_emph = emphasis.get('right_pillar')
+                if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                    _draw_emphasis_border(canvas, SIDE_LAYOUT_FRONT_WIDTH, 0, SIDE_LAYOUT_SIDE_WIDTH, OUTPUT_HEIGHT,
+                                         right_pill_emph.border_color, right_pill_emph.border_width)
         return canvas
 
     # --- LAYOUT 9: Fullscreen front with PIP thumbnails (bottom-anchored) ---
     # Triggered when all 5 secondary cameras are present AND layout is "pip"
     # Top row (pillars): smaller 280x158 thumbnails
     # Bottom row (repeaters + rear): larger 350x197 thumbnails (1.25x) for emphasis
+    # Note: PIP uses border-only emphasis (no scaling) due to fixed positions
     if layout == "pip" and active_cams == {"back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"}:
         # Front camera fills entire background
         if front is not None:
@@ -946,18 +1172,33 @@ def composite_frame(front: np.ndarray,
         top_thumb_size = (PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT)
         bottom_thumb_size = (PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT)
 
+        # Get emphasis states for border drawing
+        left_pill_emph = emphasis.left_pillar if emphasis else None
+        right_pill_emph = emphasis.right_pillar if emphasis else None
+        left_rep_emph = emphasis.left_repeater if emphasis else None
+        right_rep_emph = emphasis.right_repeater if emphasis else None
+        back_emph = emphasis.back if emphasis else None
+
         # Top row: L-PILLAR (left edge), R-PILLAR (right edge)
         if left_pill is not None:
             resized = _resize_frame(left_pill, top_thumb_size)
             canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
                    PIP_TOP_LEFT_X:PIP_TOP_LEFT_X+PIP_TOP_THUMB_WIDTH] = resized
             _draw_text(canvas, "L-PILLAR", (PIP_TOP_LEFT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+            if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, PIP_TOP_LEFT_X, PIP_TOP_ROW_Y,
+                                     PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT,
+                                     left_pill_emph.border_color, left_pill_emph.border_width)
 
         if right_pill is not None:
             resized = _resize_frame(right_pill, top_thumb_size)
             canvas[PIP_TOP_ROW_Y:PIP_TOP_ROW_Y+PIP_TOP_THUMB_HEIGHT,
                    PIP_TOP_RIGHT_X:PIP_TOP_RIGHT_X+PIP_TOP_THUMB_WIDTH] = resized
             _draw_text(canvas, "R-PILLAR", (PIP_TOP_RIGHT_X + 90, PIP_TOP_ROW_Y + PIP_TOP_THUMB_HEIGHT - 30))
+            if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, PIP_TOP_RIGHT_X, PIP_TOP_ROW_Y,
+                                     PIP_TOP_THUMB_WIDTH, PIP_TOP_THUMB_HEIGHT,
+                                     right_pill_emph.border_color, right_pill_emph.border_width)
 
         # Bottom row: L-REPEATER (left), REAR (center, with punch-in), R-REPEATER (right)
         if left_rep is not None:
@@ -965,6 +1206,10 @@ def composite_frame(front: np.ndarray,
             canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
                    PIP_BOTTOM_LEFT_X:PIP_BOTTOM_LEFT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
             _draw_text(canvas, "L-REPEATER", (PIP_BOTTOM_LEFT_X + 110, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            if left_rep_emph and left_rep_emph.border_color and left_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, PIP_BOTTOM_LEFT_X, PIP_BOTTOM_ROW_Y,
+                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                                     left_rep_emph.border_color, left_rep_emph.border_width)
 
         if back is not None:
             # Apply punch-in crop before resize to remove wide-angle vignetting
@@ -973,16 +1218,31 @@ def composite_frame(front: np.ndarray,
             canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
                    PIP_BOTTOM_CENTER_X:PIP_BOTTOM_CENTER_X+PIP_BOTTOM_THUMB_WIDTH] = resized
             _draw_text(canvas, "REAR", (PIP_BOTTOM_CENTER_X + 145, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            if back_emph and back_emph.border_color and back_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, PIP_BOTTOM_CENTER_X, PIP_BOTTOM_ROW_Y,
+                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                                     back_emph.border_color, back_emph.border_width)
 
         if right_rep is not None:
             resized = _resize_frame(right_rep, bottom_thumb_size)
             canvas[PIP_BOTTOM_ROW_Y:PIP_BOTTOM_ROW_Y+PIP_BOTTOM_THUMB_HEIGHT,
                    PIP_BOTTOM_RIGHT_X:PIP_BOTTOM_RIGHT_X+PIP_BOTTOM_THUMB_WIDTH] = resized
             _draw_text(canvas, "R-REPEATER", (PIP_BOTTOM_RIGHT_X + 105, PIP_BOTTOM_ROW_Y + PIP_BOTTOM_THUMB_HEIGHT - 30))
+            if right_rep_emph and right_rep_emph.border_color and right_rep_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, PIP_BOTTOM_RIGHT_X, PIP_BOTTOM_ROW_Y,
+                                     PIP_BOTTOM_THUMB_WIDTH, PIP_BOTTOM_THUMB_HEIGHT,
+                                     right_rep_emph.border_color, right_rep_emph.border_width)
 
         return canvas
 
     # --- DEFAULT LAYOUT: Original 6-camera grid ---
+    # Get emphasis states for border drawing
+    left_pill_emph = emphasis.left_pillar if emphasis else None
+    right_pill_emph = emphasis.right_pillar if emphasis else None
+    left_rep_emph = emphasis.left_repeater if emphasis else None
+    right_rep_emph = emphasis.right_repeater if emphasis else None
+    back_emph = emphasis.back if emphasis else None
+
     # Front
     if front is not None:
         resized = _resize_frame(front, (FRONT_CAMERA_WIDTH, TOP_SECTION_HEIGHT))
@@ -994,6 +1254,9 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(left_pill, (PILLAR_WIDTH, PILLAR_HEIGHT))
             canvas[PILLAR_Y:PILLAR_Y + PILLAR_HEIGHT, 0:PILLAR_WIDTH] = resized
             _draw_text(canvas, "L. Pillar", (20, PILLAR_Y + 10), COLORS.WHITE, 16)
+            if left_pill_emph and left_pill_emph.border_color and left_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, 0, PILLAR_Y, PILLAR_WIDTH, PILLAR_HEIGHT,
+                                     left_pill_emph.border_color, left_pill_emph.border_width)
         else:
             _draw_rectangle(canvas, 0, PILLAR_Y, PILLAR_WIDTH, PILLAR_Y + PILLAR_HEIGHT,
                            COLORS.PLACEHOLDER_GREY, fill=True)
@@ -1005,18 +1268,21 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(right_pill, (PILLAR_WIDTH, PILLAR_HEIGHT))
             canvas[PILLAR_Y:PILLAR_Y + PILLAR_HEIGHT, rx:rx + PILLAR_WIDTH] = resized
             _draw_text(canvas, "R. Pillar", (rx + 20, PILLAR_Y + 10), COLORS.WHITE, 16)
+            if right_pill_emph and right_pill_emph.border_color and right_pill_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, rx, PILLAR_Y, PILLAR_WIDTH, PILLAR_HEIGHT,
+                                     right_pill_emph.border_color, right_pill_emph.border_width)
         else:
             _draw_rectangle(canvas, rx, PILLAR_Y, rx + PILLAR_WIDTH, PILLAR_Y + PILLAR_HEIGHT,
                            COLORS.PLACEHOLDER_GREY, fill=True)
 
     # Bottom Row
     bottom_cams = [
-        ("left_repeater", left_rep, "L. Repeater"),
-        ("back", back, "Back"),
-        ("right_repeater", right_rep, "R. Repeater")
+        ("left_repeater", left_rep, "L. Repeater", left_rep_emph),
+        ("back", back, "Back", back_emph),
+        ("right_repeater", right_rep, "R. Repeater", right_rep_emph)
     ]
 
-    for i, (cam_name, cam, label) in enumerate(bottom_cams):
+    for i, (cam_name, cam, label, cam_emph) in enumerate(bottom_cams):
         if cam_name not in cameras:
             continue
         bx = i * BOTTOM_CAMERA_WIDTH
@@ -1027,6 +1293,10 @@ def composite_frame(front: np.ndarray,
             resized = _resize_frame(cam, (BOTTOM_CAMERA_WIDTH, BOTTOM_SECTION_HEIGHT))
             canvas[BOTTOM_SECTION_Y:BOTTOM_SECTION_Y + BOTTOM_SECTION_HEIGHT, bx:bx + BOTTOM_CAMERA_WIDTH] = resized
             _draw_text(canvas, label, (bx + 20, BOTTOM_SECTION_Y + 10), COLORS.WHITE, 16)
+            if cam_emph and cam_emph.border_color and cam_emph.weight > EMPHASIS_VISIBILITY_THRESHOLD:
+                _draw_emphasis_border(canvas, bx, BOTTOM_SECTION_Y,
+                                     BOTTOM_CAMERA_WIDTH, BOTTOM_SECTION_HEIGHT,
+                                     cam_emph.border_color, cam_emph.border_width)
         else:
             _draw_rectangle(canvas, bx, BOTTOM_SECTION_Y,
                            bx + BOTTOM_CAMERA_WIDTH, BOTTOM_SECTION_Y + BOTTOM_SECTION_HEIGHT,
