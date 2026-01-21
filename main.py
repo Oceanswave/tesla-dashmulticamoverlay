@@ -12,7 +12,7 @@ import multiprocessing
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Tuple, Set, Callable
+from typing import Optional, List, Tuple, Set, Callable, Union
 from dataclasses import dataclass
 from pydantic import BaseModel, Field, field_validator
 
@@ -286,10 +286,43 @@ def build_camera_paths(clip: ClipSet, cameras: Set[str]) -> dict:
             paths[key] = file_path
     return paths
 
-def parse_args() -> VideoConfig:
-    parser = argparse.ArgumentParser(description="Burn Tesla SEI metadata into connected video clips.")
+def parse_args() -> Union[VideoConfig, dict]:
+    """
+    Parse command line arguments.
+
+    Returns:
+        VideoConfig for video processing mode, or dict for export mode
+    """
+    parser = argparse.ArgumentParser(
+        description="Burn Tesla SEI metadata into connected video clips, or export telemetry to GPX/FIT.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process video with overlays
+  python main.py input/ output.mp4
+
+  # Export telemetry to GPX
+  python main.py input/ --export gpx
+
+  # Export telemetry to FIT
+  python main.py input/ --export fit -o my_drive.fit
+
+  # Export all formats with reduced sample rate
+  python main.py input/ --export all --export-sample-rate 0.1
+"""
+    )
     parser.add_argument("input_path", help="Path to input MP4 file or directory of clips")
-    parser.add_argument("output_file", help="Path to output MP4 file")
+    parser.add_argument("output_file", nargs="?", default=None,
+                       help="Path to output MP4 file (not required for --export mode)")
+
+    # Telemetry export options
+    parser.add_argument("--export", choices=["gpx", "fit", "json", "all"], default=None,
+                       metavar="FORMAT",
+                       help="Export telemetry without video processing: gpx, fit, json, or all")
+    parser.add_argument("-o", "--export-output", type=str, default=None, metavar="PATH",
+                       help="Output path for telemetry export (auto-generated if not specified)")
+    parser.add_argument("--export-sample-rate", type=float, default=1.0,
+                       help="Fraction of frames to export (1.0=all, 0.1=every 10th frame)")
     parser.add_argument("--overlay-scale", type=float, default=1.0,
                        help="Scale factor for dashboard/map overlays (default: 1.0)")
     parser.add_argument("--map-style", choices=["simple", "street", "satellite"], default="simple",
@@ -331,6 +364,23 @@ def parse_args() -> VideoConfig:
 
     # Configure logging before any other operations
     setup_logging(verbose=args.verbose)
+
+    # Handle export mode (telemetry only, no video processing)
+    if args.export:
+        return {
+            "mode": "export",
+            "input_path": args.input_path,
+            "export_format": args.export,
+            "output_path": args.export_output,
+            "sample_rate": args.export_sample_rate,
+            "verbose": args.verbose,
+        }
+
+    # Video processing mode requires output_file
+    if args.output_file is None:
+        print_error("output_file is required for video processing",
+                   hint="Use --export for telemetry-only export, or provide an output file path")
+        sys.exit(1)
 
     try:
         cameras = parse_cameras(args.cameras)
@@ -1222,8 +1272,84 @@ def process_clips_parallel(clips_data: List[tuple], color_grader: Optional[Color
 
     return temp_files
 
+
+def _handle_export_mode(config: dict) -> None:
+    """
+    Handle telemetry export mode (GPX, FIT, JSON) without video processing.
+
+    Args:
+        config: Dict with export configuration from parse_args()
+    """
+    from telemetry_export.exporter import TelemetryExporter
+
+    print_banner(__version__)
+    console.print(f"[bold cyan]Telemetry Export Mode[/] - Format: [highlight]{config['export_format'].upper()}[/]")
+    console.print()
+
+    # Discover clips
+    clips = discover_clips(config["input_path"])
+    if not clips:
+        print_error("No clips found!", hint="Check the input path contains Tesla dashcam files")
+        sys.exit(1)
+
+    console.print(f"Found [highlight]{len(clips)}[/] clip(s)")
+
+    # Create exporter with sample rate
+    exporter = TelemetryExporter(clips, sample_rate=config["sample_rate"])
+
+    # Extract telemetry with progress
+    with create_scan_progress() as progress:
+        task = progress.add_task("Extracting telemetry", total=len(clips))
+
+        def progress_cb(idx, total):
+            progress.update(task, completed=idx)
+
+        track = exporter.extract_all(progress_callback=progress_cb)
+        progress.update(task, completed=len(clips))
+
+    console.print(f"Extracted [highlight]{len(track.records)}[/] records "
+                 f"({track.duration_seconds:.1f}s, {track.distance_meters/1000:.2f}km)")
+    console.print()
+
+    # Determine output path
+    output_path = config["output_path"]
+    if output_path is None:
+        # Auto-generate from first clip timestamp
+        base_dir = os.path.dirname(config["input_path"]) if os.path.isfile(config["input_path"]) else config["input_path"]
+        base_name = clips[0].timestamp_prefix
+        output_path = os.path.join(base_dir, base_name)
+
+    # Export based on format
+    export_format = config["export_format"].lower()
+    created_files = []
+
+    try:
+        if export_format == "all":
+            created_files = exporter.export_all(output_path)
+        elif export_format == "gpx":
+            created_files.append(exporter.export_gpx(f"{output_path}.gpx"))
+        elif export_format == "fit":
+            created_files.append(exporter.export_fit(f"{output_path}.fit"))
+        elif export_format == "json":
+            created_files.append(exporter.export_json(f"{output_path}.json"))
+    except ImportError as e:
+        print_error(str(e), hint="Install missing dependencies with: pip install -r requirements.txt")
+        sys.exit(1)
+
+    # Print summary
+    console.print()
+    console.print("[bold green]\u2713 Export complete![/]")
+    for f in created_files:
+        console.print(f"  [dim]\u2192[/] {f}")
+
+
 def main():
     config = parse_args()
+
+    # Handle export mode (telemetry only, no video processing)
+    if isinstance(config, dict) and config.get("mode") == "export":
+        _handle_export_mode(config)
+        return
 
     if not config.playlist:
         return

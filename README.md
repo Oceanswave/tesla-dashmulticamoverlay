@@ -2,6 +2,9 @@
 
 A Python tool that processes Tesla dashcam footage by extracting embedded SEI (Supplemental Enhancement Information) telemetry metadata and compositing multiple camera angles into a single video with real-time overlays.
 
+<img src="./images/docs_pip_satellite.png" alt="PiP/Satellite" width="800" height="450"/>
+
+PiP, Emphasis, Color Grading, Satellite Moving Map
 ## Features
 
 - **Multi-Camera Composite**: Combines up to 6 camera angles (front, back, left/right repeaters, left/right pillars) into a single 1920x1080 video
@@ -81,6 +84,9 @@ python3 main.py /path/to/dashcam/folder/ output.mp4
 | `--shadows` | Shadow adjustment (-1.0 to 1.0) | 0 |
 | `--highlights` | Highlight adjustment (-1.0 to 1.0) | 0 |
 | `--no-emphasis` | Disable dynamic camera emphasis effects | off |
+| `--export` | Export telemetry only (no video): `gpx`, `fit`, `json`, or `all` | none |
+| `-o, --export-output` | Output path for telemetry export | auto |
+| `--export-sample-rate` | Fraction of frames to export (1.0=all, 0.1=every 10th) | 1.0 |
 | `-v, --verbose` | Enable debug logging | off |
 
 ### Camera Selection
@@ -267,6 +273,54 @@ The timestamp displays the date/time from the dashcam filename (e.g., `2024-01-1
 
 **Supported watermark formats**: PNG, JPG, GIF, BMP. The watermark is automatically resized to fit within the overlay scale while preserving aspect ratio.
 
+### Telemetry Export
+
+Export embedded telemetry data to GPS tracking formats without video processing. Useful for analyzing driving data in external tools.
+
+#### Export Formats
+
+| Format | Description | Compatible With |
+|--------|-------------|-----------------|
+| GPX | GPS Exchange Format with Tesla extensions | Google Earth, Strava, GPS trackers |
+| FIT | Garmin Flexible and Interoperable Data Transfer | Garmin Connect, TrainingPeaks, fitness apps |
+| JSON | Full telemetry with all 16 fields | Data analysis, custom tools |
+
+#### Usage
+
+```bash
+# Export to GPX (most compatible)
+python3 main.py input/ --export gpx
+
+# Export to FIT (for Garmin/fitness platforms)
+python3 main.py input/ --export fit
+
+# Export to JSON (for analysis)
+python3 main.py input/ --export json
+
+# Export all formats at once
+python3 main.py input/ --export all
+
+# Custom output path
+python3 main.py input/ --export gpx -o my_drive.gpx
+
+# Reduce file size by sampling every 10th frame
+python3 main.py input/ --export gpx --export-sample-rate 0.1
+```
+
+#### Exported Fields
+
+The export includes all 16 telemetry fields from Tesla SEI metadata:
+
+| Category | Fields |
+|----------|--------|
+| GPS | latitude, longitude, heading |
+| Motion | speed (m/s), 3-axis acceleration (m/s²) |
+| Controls | steering angle, accelerator position, brake state |
+| Signals | left/right blinkers |
+| State | gear (P/D/R/N), autopilot mode (Manual/FSD/Autosteer/TACC) |
+
+GPX files include a custom Tesla XML namespace (`http://tesla.com/gpx/telemetry/v1`) for Tesla-specific fields, while maintaining compatibility with standard GPX viewers.
+
 ### Debugging
 
 Enable verbose output to troubleshoot issues:
@@ -316,6 +370,8 @@ The composite video (1920x1080) adapts based on selected cameras:
 +--------+---------------------------+--------+
 ```
 
+<img src="./images/docs_front_right_lut.png" alt="Grid/Front+Right Pillar" width="800" height="450"/>
+
 ### Layout 4: 2x2 Grid (`--cameras front,back,left_repeater,right_repeater`)
 
 ```
@@ -356,7 +412,9 @@ Left cameras appear on the left; right cameras on the right. Examples:
 | L. Repeater|   Back (mirrored)       | R. Repeater|  Bottom: 480px
 |   640px    |       640px             |   640px    |
 +------------+-------------------------+------------+
+
 ```
+<img src="./images/docs_grid_street.png" alt="Grid/Street" width="800" height="450">
 
 ### Layout 10: Fullscreen with PIP Thumbnails (`--layout pip`)
 
@@ -374,6 +432,7 @@ Left cameras appear on the left; right cameras on the right. Examples:
 |  +----------+    +----------+    +----------+         |
 +-------------------------------------------------------+
 ```
+<img src="./images/docs_pip_satellite.png" alt="PiP/Satellite" width="800" height="450"/>
 
 Use this layout when you want the front camera to fill the entire screen with other cameras as small picture-in-picture thumbnails:
 ```bash
@@ -474,6 +533,12 @@ tesla-dashmulticamoverlay/
 ├── dashcam_pb2.py       # Generated protobuf bindings
 ├── requirements.txt     # Python dependencies
 ├── LUTs/                # Color grading LUT files (.cube)
+├── telemetry_export/    # Telemetry export module
+│   ├── __init__.py      # Package exports
+│   ├── data_models.py   # Pydantic models (TelemetryRecord, TelemetryTrack)
+│   ├── gpx_writer.py    # GPX 1.1 with Garmin/Tesla extensions
+│   ├── fit_writer.py    # Garmin FIT format export
+│   └── exporter.py      # Export orchestrator
 └── tests/               # Test suite
 ```
 

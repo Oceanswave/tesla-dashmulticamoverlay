@@ -55,6 +55,26 @@ python3 main.py input/ output.mp4 -v
 
 # Regenerate protobuf bindings (if dashcam.proto changes)
 protoc --python_out=. dashcam.proto
+
+# --- Telemetry Export (no video processing) ---
+
+# Export telemetry to GPX format (compatible with GPS trackers, Strava, Google Earth)
+python3 main.py input/ --export gpx
+
+# Export telemetry to FIT format (compatible with Garmin Connect, fitness platforms)
+python3 main.py input/ --export fit
+
+# Export telemetry to JSON format (all 16 fields, for analysis)
+python3 main.py input/ --export json
+
+# Export all formats at once
+python3 main.py input/ --export all
+
+# Custom output path
+python3 main.py input/ --export gpx -o my_drive.gpx
+
+# Reduce sample rate (every 10th frame for smaller files)
+python3 main.py input/ --export gpx --export-sample-rate 0.1
 ```
 
 **External dependency**: FFmpeg with libx264 support (used for video I/O and concatenation). Hardware encoders (VideoToolbox, NVENC) used automatically when available.
@@ -183,6 +203,30 @@ Post-composite color correction applied to the entire 1080p frame before overlay
 **Processing order**: LUT → Brightness → Contrast → Saturation → Gamma → Shadows/Highlights
 
 **Performance**: ~3-5ms per 1080p frame (uses numpy vectorized ops and pre-computed gamma LUTs)
+
+### Telemetry Export (telemetry_export/)
+
+Standalone export of SEI telemetry to GPS tracking formats without video processing.
+
+**Package structure**:
+- `data_models.py`: Pydantic models for TelemetryRecord (16 fields) and TelemetryTrack
+- `gpx_writer.py`: GPX 1.1 output with Garmin TrackPointExtension + custom Tesla namespace
+- `fit_writer.py`: Garmin FIT format with standard fields (position, speed, distance)
+- `exporter.py`: Orchestrator class with extract_all() and export_gpx/fit/json methods
+
+**Export formats**:
+| Format | Standard Fields | Tesla Extensions | Use Case |
+|--------|-----------------|------------------|----------|
+| GPX | lat, lon, time | All 16 fields in `<tesla:*>` namespace | Google Earth, Strava, GPS trackers |
+| FIT | position, speed, distance | None (standard FIT only) | Garmin Connect, fitness platforms |
+| JSON | All fields | N/A | Data analysis, custom tools |
+
+**GPX namespaces**:
+- `http://www.topografix.com/GPX/1/1` (standard)
+- `http://www.garmin.com/xmlschemas/TrackPointExtension/v2` (Garmin speed/course)
+- `http://tesla.com/gpx/telemetry/v1` (Tesla custom: gear, autopilot, steering, pedals, acceleration)
+
+**Sample rate**: `--export-sample-rate 0.1` exports every 10th frame (3fps instead of 30fps) for smaller files.
 
 ### Data Schema (dashcam.proto)
 

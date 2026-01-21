@@ -4,6 +4,7 @@ Pillow>=10.0.0
 numpy>=1.20.0
 rich>=13.0.0
 staticmap>=0.5.7  # Optional: map tiles for street/satellite view
+fit-tool>=0.9.13  # Optional: FIT file export for Garmin/fitness platforms
 
 # Development dependencies
 pytest>=7.0.0

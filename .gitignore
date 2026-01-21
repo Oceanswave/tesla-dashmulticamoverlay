@@ -216,8 +216,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Project Specific
-# Ignore all mp4 files in the project directory and subdirectories
+# Ignore all potential artifacts in the project directory and subdirectories
 *.mp4
+*.gpx
+*.fit
+*.json
 
 # Ignore everything in the data/temp_clips directory
 data/
