@@ -47,6 +47,9 @@ python3 main.py input/ output.mp4 --color-grade warm --brightness -0.05
 # Disable dynamic camera emphasis
 python3 main.py input/ output.mp4 --no-emphasis
 
+# Custom worker count (default: min(4, cpu_count))
+python3 main.py input/ output.mp4 --workers 2
+
 # Verbose mode (shows debug output for troubleshooting)
 python3 main.py input/ output.mp4 -v
 
@@ -185,6 +188,34 @@ Post-composite color correction applied to the entire 1080p frame before overlay
 
 Protobuf definition for Tesla telemetry with 16 fields including vehicle speed, gear, pedal positions, steering angle, autopilot state, GPS coordinates, and 3-axis acceleration.
 
+## Performance Characteristics
+
+**Target**: Real-time (30fps) processing for all configurations.
+
+| Configuration | FPS | Realtime | Notes |
+|--------------|-----|----------|-------|
+| Grid + Simple | 48 | 1.6x | Vector map, minimal overhead |
+| Grid + Satellite | 28 | 0.9x | Tile fetching + compositing |
+| Grid + Street | 30 | 1.0x | OSM tile fetching |
+| PIP + Simple | 64 | 2.1x | Front fullscreen, smaller thumbnails |
+| PIP + Satellite | 57 | 1.9x | Fastest tile-based config |
+| + color grading | -1-2fps | LUT application overhead |
+
+**Performance bottlenecks** (in order of impact):
+1. **Video I/O** (~20ms): Reading 6 camera streams; parallelized via ThreadPoolExecutor
+2. **Composite** (~17ms): Resizing 6 cameras to layout positions; uses OpenCV INTER_LINEAR
+3. **Map rendering** (~2-3ms): Grid/tile drawing with heading-up rotation
+4. **Dashboard** (~2-3ms): Pre-rendered base image with dynamic overlays
+
+**Optimizations applied**:
+- Parallel tile fetching (16 concurrent threads for satellite/street maps)
+- Tile memory cache holds 500 tiles (full 17×17 composite + movement headroom)
+- Frame resize skip when dimensions already match
+- Emphasis scale fast-path when weight < 2%
+- Read-ahead buffer (2x batch size) overlaps I/O with computation
+- Pre-computed emphasis/GPS/map data enables parallel frame processing
+- Composite reuse when position within 2-tile margin (avoids rebuild)
+
 ## Key Patterns
 
 - **Pydantic for config validation**: `VideoConfig` validates CLI args with type constraints
@@ -199,3 +230,8 @@ Protobuf definition for Tesla telemetry with 16 fields including vehicle speed, 
 - **Crop-then-rotate optimization**: Map rotation crops a smaller region first (using `ROTATION_MARGIN=1.5`), then rotates ~0.8M pixels instead of full composite (~20× faster)
 - **Fixed composite radius**: Tile composite uses fixed radius=8 (17×17 grid) to avoid rebuilds on speed changes; zoom handled by crop_scale instead
 - **Path drawing early-exit**: Reverse iteration with early exit when 20+ consecutive segments are off-screen; path fills visible map area at current zoom
+- **Frame count safety margin**: Use ffprobe frame count + 10% buffer to handle OpenCV/ffprobe count discrepancies
+- **Defensive bounds checking**: All pre-computed array accesses check bounds to prevent worker crashes
+- **Timestamp-based clip sorting**: Clips sorted by filename timestamp prefix, not full path, ensuring chronological order across directories
+- **Thread-safe path rendering**: Map path drawing functions take local snapshots of shared state to prevent race conditions when multiple threads call render_stateless() simultaneously
+- **FPS normalization**: Output always uses TESLA_DASHCAM_FPS (29.97) regardless of unreliable source metadata (Tesla files report incorrect r_frame_rate values like 36/1 or 10000/1); prevents sync issues when concatenating clips

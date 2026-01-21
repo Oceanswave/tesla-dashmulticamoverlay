@@ -447,3 +447,45 @@ class TestPerformance:
         result2 = grader.grade(sample_frame.copy())
 
         np.testing.assert_array_equal(result1, result2)
+
+
+class TestMultiprocessingSafety:
+    """Tests for multiprocessing safety (numba threading conflicts)."""
+
+    def test_saturation_not_using_parallel(self):
+        """Saturation numba function should not use parallel mode.
+
+        Parallel mode in numba conflicts with multiprocessing workers,
+        causing "Numba workqueue threading layer is terminating:
+        Concurrent access has been detected" errors.
+        """
+        from color_grading import _get_numba_saturation_function
+
+        func = _get_numba_saturation_function()
+
+        # If using numba, check that parallel is disabled
+        if hasattr(func, 'targetoptions'):
+            assert not func.targetoptions.get('parallel', False), \
+                "Saturation function should not use parallel=True (causes multiprocessing conflicts)"
+
+    def test_shadow_highlight_not_using_parallel(self):
+        """Shadows/highlights numba function should not use parallel mode."""
+        from color_grading import _get_numba_shadow_highlight_function
+
+        func = _get_numba_shadow_highlight_function()
+
+        # If using numba, check that parallel is disabled
+        if hasattr(func, 'targetoptions'):
+            assert not func.targetoptions.get('parallel', False), \
+                "Shadow/highlight function should not use parallel=True (causes multiprocessing conflicts)"
+
+    def test_lut_function_not_using_parallel(self):
+        """LUT numba function should not use parallel mode."""
+        from color_grading import _get_numba_lut_function
+
+        func = _get_numba_lut_function()
+
+        # If using numba, check that parallel is disabled
+        if hasattr(func, 'targetoptions'):
+            assert not func.targetoptions.get('parallel', False), \
+                "LUT function should not use parallel=True (causes multiprocessing conflicts)"

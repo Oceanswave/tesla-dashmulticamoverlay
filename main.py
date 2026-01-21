@@ -204,9 +204,21 @@ def discover_clips(input_path: str) -> List[ClipSet]:
         clips.append(find_siblings(base, prefix, front))
         
     elif os.path.isdir(input_path):
-        front_files = sorted(glob.glob(os.path.join(input_path, "**/*-front.mp4"), recursive=True))
+        # Find all front camera files
+        front_files = glob.glob(os.path.join(input_path, "**/*-front.mp4"), recursive=True)
         if not front_files:
-             front_files = sorted(glob.glob(os.path.join(input_path, "*-front.mp4")))
+            front_files = glob.glob(os.path.join(input_path, "*-front.mp4"))
+
+        # Sort by timestamp prefix (filename), not full path
+        # This ensures chronological order regardless of directory structure
+        # Tesla format: 2026-01-09_11-55-49-front.mp4
+        def get_timestamp_key(path):
+            filename = os.path.basename(path)
+            # Extract timestamp prefix before "-front.mp4"
+            prefix = filename.split("-front.mp4")[0]
+            return prefix
+
+        front_files = sorted(front_files, key=get_timestamp_key)
              
         for front in front_files:
             base = os.path.dirname(front)
@@ -412,57 +424,67 @@ def _process_frame_batch(args):
     Returns:
         Fully composited and processed canvas ready for writing
     """
-    (frames, cameras, layout, emphasis, color_grader,
-     map_renderer, map_data, dash_renderer, meta,
-     overlay_positions, watermark_img, timestamp_data) = args
+    import traceback as tb
+    try:
+        (frames, cameras, layout, emphasis, color_grader,
+         map_renderer, map_data, dash_renderer, meta,
+         overlay_positions, watermark_img, timestamp_data) = args
 
-    dash_x, dash_y, map_x, map_y = overlay_positions
+        dash_x, dash_y, map_x, map_y = overlay_positions
 
-    canvas = composite_frame(
-        front=frames['front'],
-        left_rep=frames.get('left_rep'),
-        right_rep=frames.get('right_rep'),
-        back=frames.get('back'),
-        left_pill=frames.get('left_pill'),
-        right_pill=frames.get('right_pill'),
-        cameras=cameras,
-        layout=layout,
-        emphasis=emphasis
-    )
+        canvas = composite_frame(
+            front=frames['front'],
+            left_rep=frames.get('left_rep'),
+            right_rep=frames.get('right_rep'),
+            back=frames.get('back'),
+            left_pill=frames.get('left_pill'),
+            right_pill=frames.get('right_pill'),
+            cameras=cameras,
+            layout=layout,
+            emphasis=emphasis
+        )
 
-    # Render and apply dashboard with actual telemetry (if available)
-    if meta:
-        dash_img = dash_renderer.render(meta)
-        apply_overlay(canvas, dash_img, dash_x, dash_y)
+        # Render and apply dashboard with actual telemetry (if available)
+        if meta:
+            dash_img = dash_renderer.render(meta)
+            apply_overlay(canvas, dash_img, dash_x, dash_y)
 
-    # Render and apply map using pre-computed smoothed values (parallel-safe)
-    if map_data is not None:
-        heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot = map_data
-        if lat != 0.0 or lon != 0.0:
-            map_img = map_renderer.render_stateless(
-                heading, lat, lon,
-                smooth_heading, zoom_window, crop_scale,
-                path_snapshot
-            )
-            apply_overlay(canvas, map_img, map_x, map_y)
+        # Render and apply map using pre-computed smoothed values (parallel-safe)
+        if map_data is not None:
+            heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot = map_data
+            if lat != 0.0 or lon != 0.0:
+                map_img = map_renderer.render_stateless(
+                    heading, lat, lon,
+                    smooth_heading, zoom_window, crop_scale,
+                    path_snapshot
+                )
+                apply_overlay(canvas, map_img, map_x, map_y)
 
-    # Apply color grading to composited frame
-    if color_grader is not None and color_grader.is_active:
-        canvas = color_grader.grade(canvas)
+        # Apply color grading to composited frame
+        if color_grader is not None and color_grader.is_active:
+            canvas = color_grader.grade(canvas)
 
-    # Apply watermark (Lower Right)
-    if watermark_img is not None:
-        watermark_x = OUTPUT_WIDTH - watermark_img.shape[1] - 20
-        watermark_y = OUTPUT_HEIGHT - watermark_img.shape[0] - 20
-        apply_overlay(canvas, watermark_img, watermark_x, watermark_y)
+        # Apply watermark (Lower Right)
+        if watermark_img is not None:
+            watermark_x = OUTPUT_WIDTH - watermark_img.shape[1] - 20
+            watermark_y = OUTPUT_HEIGHT - watermark_img.shape[0] - 20
+            apply_overlay(canvas, watermark_img, watermark_x, watermark_y)
 
-    # Apply timestamp (Lower Left)
-    if timestamp_data is not None:
-        timestamp_str, fps, current_frame_idx = timestamp_data
-        seconds = current_frame_idx / fps
-        render_timestamp(canvas, timestamp_str, seconds, scale=1.0)  # Scale handled by dash_renderer
+        # Apply timestamp (Lower Left)
+        if timestamp_data is not None:
+            timestamp_str, fps, current_frame_idx = timestamp_data
+            seconds = current_frame_idx / fps
+            render_timestamp(canvas, timestamp_str, seconds, scale=1.0)  # Scale handled by dash_renderer
 
-    return canvas
+        return canvas
+    except IndexError as e:
+        # Log detailed info to help debug the index error
+        logger.error(f"IndexError in _process_frame_batch: {e}")
+        logger.error(f"map_data is None: {map_data is None}")
+        if map_data is not None:
+            logger.error(f"path_snapshot length: {len(map_data[6]) if map_data[6] else 'None'}")
+        logger.error(f"Full traceback:\n{tb.format_exc()}")
+        raise
 
 
 # Number of threads for parallel frame processing within a clip
@@ -495,6 +517,23 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
         color_grader: Optional ColorGrader instance for color grading
         enable_emphasis: If True, enable dynamic camera emphasis based on driving context
     """
+    import traceback as tb
+    try:
+        return _process_clip_task_impl(clip, output_temp, overlay_scale, map_style, north_up,
+                                       history, cameras, sei_data, watermark_path, show_timestamp,
+                                       layout, color_grader, enable_emphasis)
+    except Exception as e:
+        logger.error(f"Clip {clip.timestamp_prefix} failed: {e}")
+        logger.error(f"Full traceback:\n{tb.format_exc()}")
+        raise
+
+
+def _process_clip_task_impl(clip: ClipSet, output_temp: str, overlay_scale: float, map_style: str, north_up: bool,
+                      history: List[Tuple[float, float]], cameras: Set[str], sei_data: dict,
+                      watermark_path: Optional[str] = None, show_timestamp: bool = False,
+                      layout: str = "grid", color_grader: Optional[ColorGrader] = None,
+                      enable_emphasis: bool = True):
+    """Internal implementation of process_clip_task with full error logging."""
     global _shared_frame_counter
 
     # Warm up numba JIT in this worker process to avoid 3+ second delay on first frame
@@ -520,12 +559,11 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
 
     # Use context managers for safe resource cleanup
     with VideoCaptures(camera_paths, camera_sizes=camera_sizes) as caps:
-        fps = caps['front'].fps
-        # Tesla dashcam standard is 29.97 fps (NTSC: 30000/1001)
-        # Using 30.0 causes cumulative drift at clip boundaries
-        if fps == 0 or fps > 60:
-            fps = 29.97
-            logger.debug(f"FPS fallback for {clip.timestamp_prefix}: using {fps}")
+        # ALWAYS use TESLA_DASHCAM_FPS (29.97) for output regardless of source metadata
+        # Tesla dashcam files have unreliable r_frame_rate values (e.g., 36/1, 10000/1)
+        # but actual playback is ~30 fps. Using consistent FPS prevents sync issues
+        # when concatenating clips with different metadata.
+        fps = TESLA_DASHCAM_FPS
 
         # fourcc is ignored by FFmpegWriter (always uses H.264)
         with VideoWriterContext(output_temp, 0, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT)) as out:
@@ -557,7 +595,14 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
 
             # Pre-compute all smoothed map values for parallel rendering
             # This allows map rendering to be included in the parallel batch
-            max_frames = len(sei_data) + 100  # +100 for interpolated frames without SEI
+            # Use actual frame count from ffprobe instead of SEI count estimation
+            # SEI metadata entries are sparse - videos often have more frames than metadata
+            # Add 10% safety margin since OpenCV may decode slightly more frames than ffprobe reports
+            ffprobe_frames = get_video_frame_count(clip.front)
+            if ffprobe_frames > 0:
+                max_frames = int(ffprobe_frames * 1.1)  # 10% safety margin
+            else:
+                max_frames = len(sei_data) + 500  # Generous fallback if ffprobe fails
             frame_gps_data = []  # (heading, lat, lon, speed) per frame
             path_snapshots = []  # GPS history snapshot per frame
             current_path = list(history)  # Start with initial history
@@ -591,7 +636,8 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
 
             # Batch size for parallel processing (larger batch = less synchronization overhead)
             # With read-ahead buffer, we can use larger batches without blocking
-            BATCH_SIZE = FRAME_PROCESSING_THREADS * 4
+            # Increased from *4 to *8 for better throughput on multi-core systems
+            BATCH_SIZE = max(FRAME_PROCESSING_THREADS * 8, 64)
 
             # Pre-compute overlay positions (constant for all frames)
             dash_x = (OUTPUT_WIDTH - dash_renderer.width) // 2
@@ -599,8 +645,8 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
             overlay_positions = (dash_x, DASHBOARD_Y, map_x, MAP_Y)
 
             # Use FrameBuffer for read-ahead (overlaps I/O with computation)
-            # Buffer size = 1.5x batch size to keep processing pipeline fed without excess memory
-            with FrameBuffer(caps, buffer_size=BATCH_SIZE + BATCH_SIZE // 2) as frame_buffer:
+            # Buffer size = 2x batch size to keep processing pipeline fed without excess memory
+            with FrameBuffer(caps, buffer_size=BATCH_SIZE * 2) as frame_buffer:
                 # Use ThreadPoolExecutor for parallel frame processing within a clip
                 with ThreadPoolExecutor(max_workers=FRAME_PROCESSING_THREADS) as executor:
                     while True:
@@ -619,11 +665,14 @@ def process_clip_task(clip: ClipSet, output_temp: str, overlay_scale: float, map
                             emphasis = precomputed_emphasis[current_idx] if precomputed_emphasis and current_idx < len(precomputed_emphasis) else None
 
                             # Get pre-computed map data for this frame
+                            # Defensive bounds checking on all arrays to prevent index errors
                             map_data = None
-                            if current_idx < len(smoothed_values):
+                            if (current_idx < len(smoothed_values) and
+                                current_idx < len(frame_gps_data) and
+                                current_idx < len(path_snapshots)):
                                 smooth_heading, zoom_window, crop_scale = smoothed_values[current_idx]
                                 heading, lat, lon, speed = frame_gps_data[current_idx]
-                                path_snapshot = path_snapshots[current_idx] if current_idx < len(path_snapshots) else []
+                                path_snapshot = path_snapshots[current_idx]
                                 map_data = (heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot)
 
                             # Timestamp data (if enabled)
@@ -981,7 +1030,13 @@ def process_clips_parallel(clips_data: List[tuple], color_grader: Optional[Color
             timestamp_str = parse_clip_timestamp(clip.timestamp_prefix)
 
         # Pre-compute smoothed values
-        max_frames = len(sei_data) + 100
+        # Use actual frame count instead of SEI count estimation (same fix as process_clip_task)
+        # Add 10% safety margin since OpenCV may decode slightly more frames than ffprobe reports
+        ffprobe_frames = get_video_frame_count(clip.front)
+        if ffprobe_frames > 0:
+            max_frames = int(ffprobe_frames * 1.1)  # 10% safety margin
+        else:
+            max_frames = len(sei_data) + 500  # Generous fallback
         frame_gps_data = []
         path_snapshots = []
         current_path = list(history)
@@ -1028,11 +1083,14 @@ def process_clips_parallel(clips_data: List[tuple], color_grader: Optional[Color
                 meta = sei_data.get(frame_idx)
                 emphasis = precomputed_emphasis[frame_idx] if precomputed_emphasis and frame_idx < len(precomputed_emphasis) else None
 
+                # Defensive bounds checking on all arrays to prevent index errors
                 map_data = None
-                if frame_idx < len(smoothed_values):
+                if (frame_idx < len(smoothed_values) and
+                    frame_idx < len(frame_gps_data) and
+                    frame_idx < len(path_snapshots)):
                     smooth_heading, zoom_window, crop_scale = smoothed_values[frame_idx]
                     heading, lat, lon, speed = frame_gps_data[frame_idx]
-                    path_snapshot = path_snapshots[frame_idx] if frame_idx < len(path_snapshots) else []
+                    path_snapshot = path_snapshots[frame_idx]
                     map_data = (heading, lat, lon, smooth_heading, zoom_window, crop_scale, path_snapshot)
 
                 ts_data = (timestamp_str, fps, frame_idx) if timestamp_str else None
@@ -1212,7 +1270,9 @@ def main():
     logger.debug(f"Clips with telemetry: {sum(1 for s in clip_sei_data if s)}/{len(clip_sei_data)}")
 
     # 2. Parallel Processing (rendering only - SEI already extracted)
-    num_processes = config.workers if config.workers else multiprocessing.cpu_count()
+    # Limit to 4 workers by default - more workers increase memory pressure
+    # and can cause performance degradation due to context switching
+    num_processes = config.workers if config.workers else min(4, multiprocessing.cpu_count())
     print_phase(2, 3, f"Rendering frames ([highlight]{num_processes}[/] workers)")
 
     # Create color grader (shared across all workers)
@@ -1308,7 +1368,9 @@ def main():
                         except multiprocessing.TimeoutError:
                             pass
                         except Exception as e:
+                            import traceback
                             logger.error(f"Worker process failed: {e}")
+                            logger.debug(f"Full traceback: {traceback.format_exc()}")
                             failed_clips.append(str(e))
                             clips_done += 1
 

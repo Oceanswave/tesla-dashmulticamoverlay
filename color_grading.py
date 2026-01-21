@@ -27,6 +27,88 @@ _lut_cache: Dict[str, np.ndarray] = {}
 # Pre-computed gamma lookup tables for common gamma values (faster than per-pixel pow)
 _gamma_luts: Dict[float, np.ndarray] = {}
 
+# Pre-computed combined LUTs for brightness+contrast+gamma (key: (brightness, contrast, gamma))
+_combined_luts: Dict[tuple, np.ndarray] = {}
+
+# Pre-computed shadows/highlights adjustment LUTs (key: (shadows, highlights))
+# Maps luminance (0-255) -> adjustment amount to add to each channel
+_shadow_highlight_luts: Dict[tuple, np.ndarray] = {}
+
+
+def _get_shadow_highlight_lut(shadows: float, highlights: float) -> np.ndarray:
+    """
+    Get or create a LUT for shadows/highlights adjustment.
+
+    Maps luminance (0-255) -> adjustment value to add to pixel channels.
+    This avoids computing masks per-pixel by pre-computing the adjustment curve.
+
+    Returns:
+        float32 array of shape (256,) with adjustment values (can be negative)
+    """
+    key = (round(shadows, 2), round(highlights, 2))
+
+    if key in _shadow_highlight_luts:
+        return _shadow_highlight_luts[key]
+
+    # Build LUT: for each luminance value, compute total adjustment
+    luma_normalized = np.arange(256, dtype=np.float32) / 255.0
+
+    # Shadow mask: strong in darks, fades to zero in brights (1 - luma²)
+    shadow_weight = 1.0 - luma_normalized ** 2
+
+    # Highlight mask: strong in brights, fades to zero in darks (luma²)
+    highlight_weight = luma_normalized ** 2
+
+    # Total adjustment for each luminance level
+    adjustment = shadow_weight * shadows * 0.5 + highlight_weight * highlights * 0.5
+
+    # Scale to 0-255 range
+    adjustment = adjustment * 255.0
+
+    _shadow_highlight_luts[key] = adjustment
+    return adjustment
+
+
+def _get_combined_lut(brightness: float, contrast: float, gamma: float) -> np.ndarray:
+    """
+    Get or create a combined LUT for brightness, contrast, and gamma.
+
+    These are all per-channel operations that can be pre-computed into a single
+    256-entry lookup table, reducing 3 passes to 1 fast array lookup.
+
+    Processing order matches ColorGrader.grade(): brightness -> contrast -> gamma
+    """
+    # Round values for cache key (0.01 precision)
+    key = (round(brightness, 2), round(contrast, 2), round(gamma, 2))
+
+    if key in _combined_luts:
+        return _combined_luts[key]
+
+    # Build combined LUT: for each input value 0-255, compute final output
+    lut = np.arange(256, dtype=np.float32)
+
+    # 1. Apply brightness (if non-zero)
+    if abs(brightness) >= 0.001:
+        adjustment = brightness * 255
+        lut = lut + adjustment
+
+    # 2. Apply contrast (if non-zero)
+    if abs(contrast) >= 0.001:
+        factor = 1.0 + contrast
+        lut = 128.0 + (lut - 128.0) * factor
+
+    # 3. Apply gamma (if not 1.0)
+    if abs(gamma - 1.0) >= 0.001:
+        # Normalize to 0-1, apply gamma, scale back
+        lut = np.clip(lut, 0, 255) / 255.0
+        lut = np.power(lut, 1.0 / gamma) * 255.0
+
+    # Clip and convert to uint8
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+
+    _combined_luts[key] = lut
+    return lut
+
 
 def load_cube_lut(path: str) -> Optional[np.ndarray]:
     """
@@ -118,6 +200,12 @@ _expanded_lut_cache: Dict[int, np.ndarray] = {}
 
 # Numba JIT-compiled LUT application function (compiled on first use)
 _numba_lut_func = None
+
+# Numba JIT-compiled saturation function
+_numba_saturation_func = None
+
+# Numba JIT-compiled shadows/highlights function
+_numba_shadow_highlight_func = None
 
 
 def _get_numba_lut_function():
@@ -332,9 +420,76 @@ def apply_contrast(frame: np.ndarray, amount: float) -> np.ndarray:
     return result
 
 
+def _get_numba_saturation_function():
+    """
+    Get or create the numba JIT-compiled saturation function.
+
+    Falls back to numpy if numba is unavailable.
+    """
+    global _numba_saturation_func
+
+    if _numba_saturation_func is not None:
+        return _numba_saturation_func
+
+    try:
+        from numba import njit
+
+        # NOTE: parallel=False is required because workers are already parallelized
+        # via multiprocessing. Nested parallelism causes "workqueue threading layer
+        # is terminating: Concurrent access detected" errors.
+        @njit(fastmath=True, cache=True)
+        def _apply_saturation_numba(frame, factor):
+            """Apply saturation using numba JIT."""
+            height, width, _ = frame.shape
+            result = np.empty((height, width, 3), dtype=np.uint8)
+
+            for y in range(height):
+                for x in range(width):
+                    b = float(frame[y, x, 0])
+                    g = float(frame[y, x, 1])
+                    r = float(frame[y, x, 2])
+
+                    # Rec.709 luminance
+                    luma = 0.0722 * b + 0.7152 * g + 0.2126 * r
+
+                    # Blend: result = luma + (original - luma) * factor
+                    new_b = luma + (b - luma) * factor
+                    new_g = luma + (g - luma) * factor
+                    new_r = luma + (r - luma) * factor
+
+                    # Clip and store
+                    result[y, x, 0] = max(0, min(255, int(new_b + 0.5)))
+                    result[y, x, 1] = max(0, min(255, int(new_g + 0.5)))
+                    result[y, x, 2] = max(0, min(255, int(new_r + 0.5)))
+
+            return result
+
+        _numba_saturation_func = _apply_saturation_numba
+        logger.debug("Using numba JIT for saturation")
+        return _numba_saturation_func
+
+    except ImportError:
+        logger.debug("numba not available for saturation, using numpy")
+
+        def _apply_saturation_numpy(frame, factor):
+            """Numpy fallback for saturation."""
+            frame_float = frame.astype(np.float32)
+            luminance = (0.0722 * frame_float[:, :, 0] +
+                         0.7152 * frame_float[:, :, 1] +
+                         0.2126 * frame_float[:, :, 2])
+            luma_3d = luminance[:, :, np.newaxis]
+            result = luma_3d + (frame_float - luma_3d) * factor
+            return np.clip(result, 0, 255).astype(np.uint8)
+
+        _numba_saturation_func = _apply_saturation_numpy
+        return _numba_saturation_func
+
+
 def apply_saturation(frame: np.ndarray, amount: float) -> np.ndarray:
     """
     Apply saturation adjustment using Rec.709 luminance.
+
+    Uses numba JIT compilation for ~5x speedup when available.
 
     Args:
         frame: BGR uint8 numpy array
@@ -347,23 +502,9 @@ def apply_saturation(frame: np.ndarray, amount: float) -> np.ndarray:
     if abs(amount) < 0.001:
         return frame
 
-    # Saturation factor
     factor = 1.0 + amount
-
-    # Rec.709 luminance coefficients (BGR order)
-    luma_coeffs = np.array([0.0722, 0.7152, 0.2126], dtype=np.float32)
-
-    frame_float = frame.astype(np.float32)
-
-    # Calculate luminance
-    luminance = np.sum(frame_float * luma_coeffs, axis=2, keepdims=True)
-
-    # Blend between luminance (grayscale) and original based on factor
-    # factor=0 -> grayscale, factor=1 -> original, factor>1 -> boosted
-    result = luminance + (frame_float - luminance) * factor
-    result = np.clip(result, 0, 255).astype(np.uint8)
-
-    return result
+    sat_func = _get_numba_saturation_function()
+    return sat_func(frame, factor)
 
 
 def apply_gamma(frame: np.ndarray, gamma: float) -> np.ndarray:
@@ -407,9 +548,80 @@ def apply_gamma(frame: np.ndarray, gamma: float) -> np.ndarray:
     return gamma_lut[frame]
 
 
+def _get_numba_shadow_highlight_function():
+    """
+    Get or create the numba JIT-compiled shadows/highlights function.
+
+    Falls back to numpy if numba is unavailable.
+    """
+    global _numba_shadow_highlight_func
+
+    if _numba_shadow_highlight_func is not None:
+        return _numba_shadow_highlight_func
+
+    try:
+        from numba import njit
+
+        # NOTE: parallel=False is required because workers are already parallelized
+        # via multiprocessing. Nested parallelism causes threading layer conflicts.
+        @njit(fastmath=True, cache=True)
+        def _apply_shadow_highlight_numba(frame, adjustment_lut):
+            """Apply shadows/highlights using numba JIT."""
+            height, width, _ = frame.shape
+            result = np.empty((height, width, 3), dtype=np.uint8)
+
+            for y in range(height):
+                for x in range(width):
+                    b = frame[y, x, 0]
+                    g = frame[y, x, 1]
+                    r = frame[y, x, 2]
+
+                    # Compute luminance (integer approximation of Rec.709)
+                    # luma = 0.0722*B + 0.7152*G + 0.2126*R ≈ (18*B + 183*G + 54*R) >> 8
+                    luma = (18 * int(b) + 183 * int(g) + 54 * int(r)) >> 8
+                    if luma > 255:
+                        luma = 255
+
+                    # Look up adjustment
+                    adj = adjustment_lut[luma]
+
+                    # Apply to all channels
+                    new_b = float(b) + adj
+                    new_g = float(g) + adj
+                    new_r = float(r) + adj
+
+                    # Clip and store
+                    result[y, x, 0] = max(0, min(255, int(new_b + 0.5)))
+                    result[y, x, 1] = max(0, min(255, int(new_g + 0.5)))
+                    result[y, x, 2] = max(0, min(255, int(new_r + 0.5)))
+
+            return result
+
+        _numba_shadow_highlight_func = _apply_shadow_highlight_numba
+        logger.debug("Using numba JIT for shadows/highlights")
+        return _numba_shadow_highlight_func
+
+    except ImportError:
+        logger.debug("numba not available for shadows/highlights, using numpy")
+
+        def _apply_shadow_highlight_numpy(frame, adjustment_lut):
+            """Numpy fallback for shadows/highlights."""
+            luma = ((18 * frame[:, :, 0].astype(np.int32) +
+                     183 * frame[:, :, 1].astype(np.int32) +
+                     54 * frame[:, :, 2].astype(np.int32)) >> 8).astype(np.uint8)
+            adjustment = adjustment_lut[luma]
+            result = frame.astype(np.float32) + adjustment[:, :, np.newaxis]
+            return np.clip(result, 0, 255).astype(np.uint8)
+
+        _numba_shadow_highlight_func = _apply_shadow_highlight_numpy
+        return _numba_shadow_highlight_func
+
+
 def apply_shadows_highlights(frame: np.ndarray, shadows: float, highlights: float) -> np.ndarray:
     """
-    Apply shadows and highlights adjustment.
+    Apply shadows and highlights adjustment using pre-computed LUT.
+
+    Uses numba JIT compilation for ~5x speedup when available.
 
     Shadows affects dark tones (lifts or crushes blacks).
     Highlights affects bright tones (lifts or crushes whites).
@@ -427,33 +639,12 @@ def apply_shadows_highlights(frame: np.ndarray, shadows: float, highlights: floa
     if abs(shadows) < 0.001 and abs(highlights) < 0.001:
         return frame
 
-    frame_float = frame.astype(np.float32) / 255.0
+    # Get pre-computed adjustment LUT
+    adjustment_lut = _get_shadow_highlight_lut(shadows, highlights)
 
-    # Luminance for tone targeting (Rec.709, BGR order)
-    luma = 0.0722 * frame_float[:, :, 0] + 0.7152 * frame_float[:, :, 1] + 0.2126 * frame_float[:, :, 2]
-
-    # Shadow mask: strong in darks, fades to zero in brights
-    # Using smooth S-curve: 1 - luma² gives good falloff
-    shadow_mask = (1.0 - luma ** 2)[:, :, np.newaxis]
-
-    # Highlight mask: strong in brights, fades to zero in darks
-    # Using luma² for smooth transition
-    highlight_mask = (luma ** 2)[:, :, np.newaxis]
-
-    # Apply adjustments
-    result = frame_float.copy()
-
-    if abs(shadows) >= 0.001:
-        # Shadow adjustment (positive lifts, negative crushes)
-        result = result + shadow_mask * shadows * 0.5
-
-    if abs(highlights) >= 0.001:
-        # Highlight adjustment (positive lifts, negative crushes)
-        result = result + highlight_mask * highlights * 0.5
-
-    result = np.clip(result * 255, 0, 255).astype(np.uint8)
-
-    return result
+    # Use numba-accelerated function
+    sh_func = _get_numba_shadow_highlight_function()
+    return sh_func(frame, adjustment_lut)
 
 
 class ColorGrader:
@@ -572,11 +763,9 @@ class ColorGrader:
 
         Processing order:
         1. LUT (if loaded)
-        2. Brightness
-        3. Contrast
-        4. Saturation
-        5. Gamma
-        6. Shadows/Highlights
+        2. Brightness + Contrast + Gamma (combined into single LUT for speed)
+        3. Saturation
+        4. Shadows/Highlights
 
         Args:
             frame: BGR uint8 numpy array (OpenCV format)
@@ -589,27 +778,23 @@ class ColorGrader:
 
         result = frame
 
-        # 1. Apply LUT first (major color transform)
+        # 1. Apply color LUT first (major color transform)
         if self.lut is not None:
             result = apply_lut(result, self.lut)
 
-        # 2. Brightness
-        if abs(self.brightness) >= 0.001:
-            result = apply_brightness(result, self.brightness)
+        # 2. Combined brightness/contrast/gamma via pre-computed LUT (fast single pass)
+        has_bcg = (abs(self.brightness) >= 0.001 or
+                   abs(self.contrast) >= 0.001 or
+                   abs(self.gamma - 1.0) >= 0.001)
+        if has_bcg:
+            combined_lut = _get_combined_lut(self.brightness, self.contrast, self.gamma)
+            result = combined_lut[result]  # Single array lookup for all 3 operations
 
-        # 3. Contrast
-        if abs(self.contrast) >= 0.001:
-            result = apply_contrast(result, self.contrast)
-
-        # 4. Saturation
+        # 3. Saturation (requires luminance calculation, can't be LUT'd)
         if abs(self.saturation) >= 0.001:
             result = apply_saturation(result, self.saturation)
 
-        # 5. Gamma
-        if abs(self.gamma - 1.0) >= 0.001:
-            result = apply_gamma(result, self.gamma)
-
-        # 6. Shadows/Highlights
+        # 4. Shadows/Highlights
         if abs(self.shadows) >= 0.001 or abs(self.highlights) >= 0.001:
             result = apply_shadows_highlights(result, self.shadows, self.highlights)
 
