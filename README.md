@@ -1,6 +1,6 @@
 # Tesla Dashcam Multi-Camera Overlay
 
-A Python tool that processes Tesla dashcam footage by extracting embedded SEI (Supplemental Enhancement Information) telemetry metadata and compositing multiple camera angles into a single video with real-time overlays.
+A Python tool that processes Tesla dashcam footage by extracting embedded SEI (Supplemental Enhancement Information) telemetry metadata and compositing multiple camera angles into a single video with real-time overlays. Can also export telemetry to GPX, FIT, and JSON formats for use with mapping and fitness platforms.
 
 <img src="./images/docs_pip_satellite.png" alt="PiP/Satellite" width="800" height="450"/>
 
@@ -27,6 +27,11 @@ PiP, Emphasis, Color Grading, Satellite Moving Map
   - 8 built-in presets including **Cybertruck** (cold steel aesthetic matching the UI)
   - Support for industry-standard .cube LUT files (13 included)
   - Fine-tune brightness, contrast, saturation, gamma, shadows, highlights
+- **Telemetry Export**: Extract embedded telemetry to standard GPS formats without video processing
+  - **GPX**: Compatible with Google Earth, Strava, and GPS tracking apps
+  - **FIT**: Compatible with Garmin Connect, TrainingPeaks, and fitness platforms
+  - **JSON**: Full telemetry dump with all 16 fields for data analysis
+  - Includes GPS, speed, acceleration, steering, pedals, gear, autopilot state, and blinkers
 
 ## Requirements
 
