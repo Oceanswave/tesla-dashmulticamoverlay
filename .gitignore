@@ -231,7 +231,6 @@ data/
 
 # Test assets and extracted GPS data (may contain personal location info)
 sample_gps_data.json
-images/
 
 # macOS metadata
 .DS_Store
